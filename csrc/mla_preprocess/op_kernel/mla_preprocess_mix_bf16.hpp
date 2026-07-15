@@ -76,7 +76,7 @@ public:
             // headDim uint32 (256B for headDim=64). Placed right after negLocal region.
             // Requires headDim <= 64 (one Gather iteration) and headDim*sizeof(float) 32B-aligned.
             this->gatherOffsetLocal_ =
-                buf.GetBuffer<BufferType::ASCEND_UB, uint32_t>(dataSizeFp32 * 5 + dataSizeFp16 * 3);
+                buf.GetBuffer<BufferType::ASCEND_UB, uint32_t>(192 * 1024 - 128 * sizeof(uint32_t));
             for (uint32_t j = 0; j < this->headDim; ++j) {
                 this->gatherOffsetLocal_.SetValue(j, (j ^ 1) * static_cast<uint32_t>(sizeof(float)));
             }
@@ -2542,7 +2542,8 @@ private:
         const AscendC::LocalTensor<float> &rmsNormTensor, const AscendC::LocalTensor<float> &gammaFp32,
         const AscendC::LocalTensor<float> &ropeKTensor, const AscendC::LocalTensor<float> &ropeKRevertTensor,
         const AscendC::LocalTensor<float> &calTensor, const AscendC::LocalTensor<T1> &outTmpTensor,
-        AscendC::LocalTensor<half> &tmpfp16, AscendC::LocalTensor<int8_t> &int8OutTensor, float quantScale3)
+        AscendC::LocalTensor<half> &tmpfp16, AscendC::LocalTensor<int8_t> &int8OutTensor, float quantScale3,
+        const AscendC::LocalTensor<uint32_t> &kGatherOffsetTensor)
     {
         int64_t slotMapGmOffset = vectorBlockIdx * row_work;
         AscendC::DataCopy(gammaTensor, gamma3GmTensor, SPLIT_RMSNRORM_SIZE_ONE);
@@ -2644,15 +2645,35 @@ private:
             }
             /* RmsNorm end */
             /* Rope K start */
-            uint64_t revertOffset = SPLIT_RMSNRORM_SIZE_TWO / 2;
+            // out = K*cos + rotate(K)*sin.
+            //   NeoX:        rotate = front/back half swap; sign [-1..-1, +1..+1].
+            //   interleaved: rotate = adjacent-pair swap (Gather dst[j]=src[j^1]);
+            //                sign [-1,+1,-1,+1,...].
+            // The four Mul/Mul/Mul/Add below are style-independent; only swap + sign differ.
             Cast(ropeKTensor, srcTensor[SPLIT_RMSNRORM_SIZE_ONE], AscendC::RoundMode::CAST_NONE,
                  SPLIT_RMSNRORM_SIZE_TWO);
-            Cast(ropeKRevertTensor[revertOffset], srcTensor[SPLIT_RMSNRORM_SIZE_ONE], AscendC::RoundMode::CAST_NONE,
-                 revertOffset);
-            Cast(ropeKRevertTensor, srcTensor[SPLIT_RMSNRORM_SIZE_ONE + revertOffset], AscendC::RoundMode::CAST_NONE,
-                 revertOffset);
-            Duplicate(calTensor, static_cast<float>(-1), revertOffset);
-            Duplicate(calTensor[revertOffset], static_cast<float>(1), revertOffset);
+            AscendC::PipeBarrier<PIPE_V>();
+            if (mlaParams.is_neox_style) {
+                uint64_t revertOffset = SPLIT_RMSNRORM_SIZE_TWO / 2;
+                Cast(ropeKRevertTensor[revertOffset], srcTensor[SPLIT_RMSNRORM_SIZE_ONE],
+                     AscendC::RoundMode::CAST_NONE, revertOffset);
+                Cast(ropeKRevertTensor, srcTensor[SPLIT_RMSNRORM_SIZE_ONE + revertOffset],
+                     AscendC::RoundMode::CAST_NONE, revertOffset);
+                Duplicate(calTensor, static_cast<float>(-1), revertOffset);
+                Duplicate(calTensor[revertOffset], static_cast<float>(1), revertOffset);
+            } else {
+                // Adjacent-pair swap: ropeKRevertTensor[j] = ropeKTensor[j^1].
+                // count=64 = one Gather iteration (256B), 32B-aligned. Reuses Q-carrier idiom.
+                AscendC::Gather(ropeKRevertTensor, ropeKTensor, kGatherOffsetTensor, (uint32_t)0,
+                                SPLIT_RMSNRORM_SIZE_TWO);
+                AscendC::PipeBarrier<PIPE_V>();
+                // Alternating sign [-1,+1,-1,+1,...] over the 64-element carrier.
+                for (uint32_t i = 0; i < SPLIT_RMSNRORM_SIZE_TWO; ++i) {
+                    calTensor.SetValue(i, (i & 1) ? static_cast<float>(1) : static_cast<float>(-1));
+                }
+                AscendC::SetFlag<HardEvent::S_V>(EVENT_ID2);
+                AscendC::WaitFlag<HardEvent::S_V>(EVENT_ID2);
+            }
             AscendC::PipeBarrier<PIPE_V>();
             Cast(calTensor[SPLIT_RMSNRORM_SIZE_TWO], cosTensor, AscendC::RoundMode::CAST_NONE, SPLIT_RMSNRORM_SIZE_TWO);
             Cast(calTensor[SPLIT_RMSNRORM_SIZE_TWO * 2], sinTensor, AscendC::RoundMode::CAST_NONE,
@@ -2905,6 +2926,25 @@ MLAOperation<InDtype, CACHE_MODE, weightFormat1, weightFormat2, weightFormat3, q
                                 MM1_OUT_SIZE * 4 * 2 + 32;
         AscendC::LocalTensor<InDtype> temp_tensor = buf.GetBuffer<BufferType::ASCEND_UB, InDtype>(out_ub_offset);
 
+        // K-carrier gather offset table for interleaved RoPE (adjacent-pair swap dst[j]=src[j^1]).
+        // 64 uint32 = 256B, placed AFTER all active tmp32 sub-buffers.
+        // tmp32 layout (float offsets): rmsNorm[0..512) gammaFp32[512..1024) ropeK[1024..1088)
+        // ropeKRevert[1088..1152) calTensor[1152..1728) (RmsNorm compute [0..512), ReduceSum
+        // out/scratch [512..1024), PER_TOKEN_SYMM mm/deScale [576..1152)) => high-water mark =
+        // tmp32[2880) = byte 11520. NZCACHE tmpfp16 aliases ropeK/ropeKRevert region [4096,5120)B
+        // and is also below 11520. So byte 11520 (= rms3_ub_offset + 2880*4) is free in all cache
+        // modes and naturally 32B-aligned. Matches Task 3 (table after all active buffers).
+        // Built once here (outside the per-token loop) and reused every token (read-only by Gather).
+        AscendC::LocalTensor<uint32_t> kGatherOffsetTensor =
+            buf.GetBuffer<BufferType::ASCEND_UB, uint32_t>(192 * 1024 - 64 * sizeof(uint32_t));
+        if (!mlaParams.is_neox_style) {
+            for (uint32_t j = 0; j < SPLIT_RMSNRORM_SIZE_TWO; ++j) {
+                kGatherOffsetTensor.SetValue(j, (j ^ 1) * static_cast<uint32_t>(sizeof(float)));
+            }
+            AscendC::SetFlag<HardEvent::S_V>(EVENT_ID2);
+            AscendC::WaitFlag<HardEvent::S_V>(EVENT_ID2);
+        }
+
         AscendC::LocalTensor<half> tmpfp16;
         AscendC::LocalTensor<int8_t> int8OutTensor;
         float scale3 = 0;
@@ -2938,7 +2978,7 @@ MLAOperation<InDtype, CACHE_MODE, weightFormat1, weightFormat2, weightFormat3, q
             tmp32_tensor[SPLIT_RMSNRORM_SIZE_ONE + SPLIT_RMSNRORM_SIZE_ONE + SPLIT_RMSNRORM_SIZE_TWO],
             tmp32_tensor[SPLIT_RMSNRORM_SIZE_ONE + SPLIT_RMSNRORM_SIZE_ONE + SPLIT_RMSNRORM_SIZE_TWO +
                          SPLIT_RMSNRORM_SIZE_TWO],
-            temp_tensor, tmpfp16, int8OutTensor, scale3);
+            temp_tensor, tmpfp16, int8OutTensor, scale3, kGatherOffsetTensor);
     }
     mm_w8a8_aiv_2.Process();
     FftsCrossCoreSync<PIPE_MTE3, 0>(MM2OUT);
