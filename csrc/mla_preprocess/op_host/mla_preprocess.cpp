@@ -127,6 +127,7 @@ struct OpParam {
     uint32_t headNum;
     int32_t cacheMode;
     QuantMode quantMode;
+    bool isNeoxStyle;
     caffe2::TypeMeta inDtype;
 };
 
@@ -598,6 +599,7 @@ void MlaPreprocessTiling::Init()
 
     SetMlapoWorkSpace();
     SetTilingKey();
+    tilingData->is_neox_style = opParam.isNeoxStyle;
 
     return;
 }
@@ -628,7 +630,7 @@ std::tuple<at::Tensor &, at::Tensor &, at::Tensor &, at::Tensor &> mla_preproces
     const at::Tensor &quant_scale0, const at::Tensor &quant_offset0, const at::Tensor &bias0,
     const at::Tensor &quant_scale1, const at::Tensor &quant_offset1, const at::Tensor &bias1,
     const c10::optional<at::Tensor> &ctkv_scale, const c10::optional<at::Tensor> &q_nope_scale,
-    c10::optional<c10::string_view> cache_mode, c10::optional<c10::string_view> quant_mode, at::Tensor &q_out0,
+    c10::optional<c10::string_view> cache_mode, c10::optional<c10::string_view> quant_mode, bool is_neox_style, at::Tensor &q_out0,
     at::Tensor &kv_cache_out0, at::Tensor &q_out1, at::Tensor &kv_cache_out1)
 {
     auto cacheMode = get_op_mode(cache_mode_map, cache_mode, "krope_ctkv", "cache_mode");
@@ -665,6 +667,7 @@ std::tuple<at::Tensor &, at::Tensor &, at::Tensor &, at::Tensor &> mla_preproces
     opParam.headNum = headNum;
     opParam.cacheMode = static_cast<int32_t>(cacheMode);
     opParam.quantMode = static_cast<QuantMode>(quantMode);
+    opParam.isNeoxStyle = is_neox_style;
     opParam.inDtype = hiddenState.options().dtype();
 
     MlaTilingData tilingData;

@@ -61,7 +61,7 @@ mla_preprocess(const at::Tensor &hiddenState, const at::Tensor &gamma0,
                const c10::optional<at::Tensor> &ctkv_scale,
                const c10::optional<at::Tensor> &q_nope_scale,
                c10::optional<c10::string_view> cache_mode,
-               c10::optional<c10::string_view> quant_mode, at::Tensor &q_out0,
+               c10::optional<c10::string_view> quant_mode, bool is_neox_style, at::Tensor &q_out0,
                at::Tensor &kv_cache_out0, at::Tensor &q_out1,
                at::Tensor &kv_cache_out1);
 

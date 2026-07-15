@@ -130,6 +130,7 @@ extern "C" __global__ __aicore__ void mla_preprocess(
     mlaTilingData.s3Offset = tilingData->s3Offset;
     mlaTilingData.s4Offset = tilingData->s4Offset;
     mlaTilingData.s5Offset = tilingData->s5Offset;
+    mlaTilingData.is_neox_style = tilingData->is_neox_style;
 
     GM_ADDR s1 = workspace + static_cast<uint64_t>(mlaTilingData.s1Offset);
     GM_ADDR s2 = workspace + static_cast<uint64_t>(mlaTilingData.s2Offset);

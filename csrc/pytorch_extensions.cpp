@@ -55,7 +55,7 @@ TORCH_LIBRARY_FRAGMENT(npu, m)
         "Tensor quant_scale0, Tensor quant_offset0, Tensor bias0, "
         "Tensor quant_scale1, Tensor quant_offset1, Tensor bias1, *, "
         "Tensor? ctkv_scale=None, Tensor? q_nope_scale=None, "
-        "str? cache_mode=None, str? quant_mode=None, "
+        "str? cache_mode=None, str? quant_mode=None, bool is_neox_style=True, "
         "Tensor(a!) q_out0, Tensor(b!) kv_cache_out0, Tensor(c!) q_out1, Tensor(d!) kv_cache_out1) "
         "-> (Tensor(a!), Tensor(b!), Tensor(c!), Tensor(d!))");
 

@@ -93,6 +93,9 @@ struct MlaTilingData {
 
     // hidden state dimension
     uint32_t hiddenStateDim{7168};
+
+    // RoPE style: true=NeoX (rotate-half), false=interleaved (adjacent-pair)
+    bool is_neox_style{true};
 };
 
 #endif  // MLAPREPROCESS_TILING_H
