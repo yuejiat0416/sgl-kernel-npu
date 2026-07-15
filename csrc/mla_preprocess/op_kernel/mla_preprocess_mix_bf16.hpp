@@ -68,6 +68,21 @@ public:
         dataSizeFp16 = dataNum * sizeof(QkDtype);
         dataSizeFp32 = dataNum * sizeof(float);
         uint32_t concatDataSize = this->concatSize * sizeof(QkDtype) * this->maxNPerLoopForUb;
+
+        // RoPE style: true=NeoX (rotate-half), false=interleaved (adjacent-pair swap).
+        this->is_neox_style_ = ropeConcatParams.is_neox_style;
+        if (!this->is_neox_style_) {
+            // Pre-build gather offset table for adjacent-pair swap: dst[j] = src[j^1].
+            // headDim uint32 (256B for headDim=64). Placed right after negLocal region.
+            // Requires headDim <= 64 (one Gather iteration) and headDim*sizeof(float) 32B-aligned.
+            this->gatherOffsetLocal_ =
+                buf.GetBuffer<BufferType::ASCEND_UB, uint32_t>(dataSizeFp32 * 5 + dataSizeFp16 * 3);
+            for (uint32_t j = 0; j < this->headDim; ++j) {
+                this->gatherOffsetLocal_.SetValue(j, (j ^ 1) * static_cast<uint32_t>(sizeof(float)));
+            }
+            AscendC::SetFlag<HardEvent::S_V>(EVENT_ID2);
+            AscendC::WaitFlag<HardEvent::S_V>(EVENT_ID2);
+        }
     }
 
     __aicore__ inline void Process()
@@ -156,16 +171,24 @@ public:
         }
         WAIT_FLAG(MTE3, MTE2, EVENT_ID1);
     }
-    // tensor -1 -1 -1 1 1 1
+    // NeoX: sign vector [-1...-1, +1...+1] (front rotateStride_ = -1, back = +1).
+    // interleaved: sign vector [-1,+1,-1,+1,...] (alternating, length headDim).
     template <typename BUF_TYPE>
     __aicore__ inline void ExpandNeg(const AscendC::LocalTensor<BUF_TYPE> &tempBuf, uint32_t headNumTemp)
     {
-        for (uint32_t i = 0; i < this->rotateStride_; ++i) {
-            tempBuf.SetValue(i, (BUF_TYPE)-1);
-            tempBuf.SetValue(i + this->rotateStride_, (BUF_TYPE)1);
+        if (this->is_neox_style_) {
+            for (uint32_t i = 0; i < this->rotateStride_; ++i) {
+                tempBuf.SetValue(i, (BUF_TYPE)-1);
+                tempBuf.SetValue(i + this->rotateStride_, (BUF_TYPE)1);
+            }
+        } else {
+            for (uint32_t i = 0; i < this->headDim; ++i) {
+                tempBuf.SetValue(i, (i & 1) ? (BUF_TYPE)1 : (BUF_TYPE)-1);
+            }
         }
         AscendC::SetFlag<HardEvent::S_V>(EVENT_ID1);
         AscendC::WaitFlag<HardEvent::S_V>(EVENT_ID1);
+        // Broadcast row 0 (headDim elements) to remaining rows. Shared by both styles.
         AscendC::Copy(tempBuf[this->headDim], tempBuf, this->headDim, headNumTemp - 1, {1, 1, headBlockLenFP32, 0});
         AscendC::PipeBarrier<PIPE_V>();
     }
@@ -184,9 +207,21 @@ public:
         // cast fp32
         AscendC::Cast(tempBufQCast, tempBufQ, AscendC::RoundMode::CAST_NONE, loopN * this->headDim);
         AscendC::PipeBarrier<PIPE_V>();
-        // move out reverseQ
-        AscendC::DataCopy(tempBufRverseQ, tempBufQCast[this->rotateStride_], {loopN, rotaryLen, rotaryLen, rotaryLen});
-        AscendC::DataCopy(tempBufRverseQ[this->rotateStride_], tempBufQCast, {loopN, rotaryLen, rotaryLen, rotaryLen});
+        // Generate reverseQ.
+        //   NeoX: swap front/back halves (rotate-half).
+        //   interleaved: adjacent-pair swap dst[j]=src[j^1] via per-row Gather.
+        if (this->is_neox_style_) {
+            AscendC::DataCopy(tempBufRverseQ, tempBufQCast[this->rotateStride_], {loopN, rotaryLen, rotaryLen, rotaryLen});
+            AscendC::DataCopy(tempBufRverseQ[this->rotateStride_], tempBufQCast, {loopN, rotaryLen, rotaryLen, rotaryLen});
+        } else {
+            // Requires headDim <= 64 (one Gather iteration = 64 float = 256B) and
+            // headDim*sizeof(float) 32B-aligned. headDim=64 satisfies both; each row
+            // r starts at r*headDim*4 = r*256B, always 32B-aligned.
+            for (uint16_t r = 0; r < loopN; ++r) {
+                AscendC::Gather(tempBufRverseQ[r * this->headDim], tempBufQCast[r * this->headDim],
+                                this->gatherOffsetLocal_, (uint32_t)0, this->headDim);
+            }
+        }
         AscendC::PipeBarrier<PIPE_V>();
     }
 
@@ -241,6 +276,9 @@ private:
     uint16_t rotaryLen{0};
     uint16_t concatBlockLen{0};
     uint64_t outLineOffset{0};
+
+    bool is_neox_style_{true};
+    AscendC::LocalTensor<uint32_t> gatherOffsetLocal_;
 };
 
 __aicore__ inline void ReduceSumCustom(const AscendC::LocalTensor<float> &dst_local,
