@@ -64,6 +64,18 @@ def apply_rope_half(
     return (x.float() * cos.float() + rotate_half(x.float()) * sin.float()).to(x.dtype)
 
 
+def apply_rope_interleaved(
+    x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor
+) -> torch.Tensor:
+    """Interleaved RoPE: rotate by adjacent pairs (counterpart to apply_rope_half)."""
+    x1 = x[..., 0::2]
+    x2 = x[..., 1::2]
+    rot = torch.stack((-x2, x1), dim=-1).flatten(-2).float()
+    sin = sin.unsqueeze(1)
+    cos = cos.unsqueeze(1)
+    return (x.float() * cos.float() + rot * sin.float()).to(x.dtype)
+
+
 def rms_norm(x: torch.Tensor, gamma: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
     var = x.float().pow(2).mean(dim=-1, keepdim=True)
     x_norm = x.float() * torch.rsqrt(var + eps)
@@ -323,6 +335,7 @@ class TestMLAPO(TestCase):
         headNum=HEADS_Q,
         dtype=torch.bfloat16,
         cache_mode="krope_ctkv",
+        rope_style="half",
         dev="npu",
     ):
         # MM1: quantize & quant matmul
@@ -372,11 +385,12 @@ class TestMLAPO(TestCase):
         q_nope_out = torch.bmm(q_nope.transpose(0, 1), self.dataDict["wuk"]).transpose(
             0, 1
         )
-        # === ROPE ===
-        q_pe_rope = apply_rope_half(
+        # === ROPE === (rope_style: 'half' or 'interleaved')
+        rope_fn = apply_rope_interleaved if rope_style == "interleaved" else apply_rope_half
+        q_pe_rope = rope_fn(
             q_pe, self.dataDict["cos"], self.dataDict["sin"]
         ).to(dtype)
-        k_pe_rope = apply_rope_half(
+        k_pe_rope = rope_fn(
             k_pe, self.dataDict["cos"], self.dataDict["sin"]
         ).to(dtype)
 
@@ -407,6 +421,7 @@ class TestMLAPO(TestCase):
         headNum=HEADS_Q,
         dtype=torch.bfloat16,
         cache_mode="krope_ctkv",
+        rope_style="half",
         dev="cpu",
     ):
         # MM1: quantize & quant matmul
@@ -451,11 +466,12 @@ class TestMLAPO(TestCase):
             0, 1
         )
 
-        # === ROPE ===
-        q_pe_rope = apply_rope_half(
+        # === ROPE === (rope_style: 'half' or 'interleaved')
+        rope_fn = apply_rope_interleaved if rope_style == "interleaved" else apply_rope_half
+        q_pe_rope = rope_fn(
             q_pe, self.dataDict["cos"], self.dataDict["sin"]
         ).to(dtype)
-        k_pe_rope = apply_rope_half(
+        k_pe_rope = rope_fn(
             k_pe, self.dataDict["cos"], self.dataDict["sin"]
         ).to(dtype)
 
@@ -500,7 +516,7 @@ class TestMLAPO(TestCase):
 
     cache_mode_names = {1: "krope_ctkv", 2: "int8_nzcache", 3: "nzcache"}
 
-    def run_tests_and_compare(self, cacheMode, golden, dtype, seed=SEED):
+    def run_tests_and_compare(self, cacheMode, golden, dtype, seed=SEED, rope_style="half"):
         cache_mode = self.cache_mode_names[cacheMode]
         device = "npu"
         if dtype == torch.float16 and cache_mode != "krope_ctkv":
@@ -524,11 +540,13 @@ class TestMLAPO(TestCase):
 
             if golden == 1:
                 golden_out = self.golden1_torch_npu(
-                    N=N, headNum=headNum, dtype=dtype, cache_mode=cache_mode, dev=device
+                    N=N, headNum=headNum, dtype=dtype, cache_mode=cache_mode,
+                    rope_style=rope_style, dev=device,
                 )
             else:
                 golden_out = self.golden2_pytorch(
-                    N=N, headNum=headNum, dtype=dtype, cache_mode=cache_mode, dev=device
+                    N=N, headNum=headNum, dtype=dtype, cache_mode=cache_mode,
+                    rope_style=rope_style, dev=device,
                 )
 
             self.dataDict["wdqkv"] = transdata(self.dataDict["wdqkv"], (16, 32))
@@ -568,6 +586,7 @@ class TestMLAPO(TestCase):
                 q_nope_scale=self.dataDict["qnope_scale"].npu(),
                 cache_mode=cache_mode,
                 quant_mode="per_tensor_quant_asymm",
+                is_neox_style=(rope_style == "half"),
                 q_out0=self.dataDict["q_nope_out"].npu(),
                 kv_cache_out0=self.dataDict["keyCache_nope"].npu(),
                 q_out1=self.dataDict["q_rope_out"].npu(),
@@ -802,6 +821,26 @@ class TestMLAPO(TestCase):
             golden=self.GoldenType.PYTORCH_NATIVE,
             dtype=torch.float16,
             seed=SEED,
+        )
+
+    def test_mla_preprocess_ops_bf16_cachemode1_golden1_rope_interleaved(self):
+        # interleaved RoPE mode (is_neox_style=False).
+        self.run_tests_and_compare(
+            cacheMode=1,
+            golden=self.GoldenType.NPU_SMALL_OPS,
+            dtype=torch.bfloat16,
+            seed=SEED,
+            rope_style="interleaved",
+        )
+
+    def test_mla_preprocess_ops_bf16_cachemode1_golden2_rope_interleaved(self):
+        # interleaved RoPE mode (is_neox_style=False).
+        self.run_tests_and_compare(
+            cacheMode=1,
+            golden=self.GoldenType.PYTORCH_NATIVE,
+            dtype=torch.bfloat16,
+            seed=SEED,
+            rope_style="interleaved",
         )
 
 
