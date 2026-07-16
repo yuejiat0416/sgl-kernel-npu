@@ -843,6 +843,42 @@ class TestMLAPO(TestCase):
             rope_style="interleaved",
         )
 
+    def test_mla_preprocess_ops_bf16_cachemode2_golden1_rope_interleaved(self):
+        self.run_tests_and_compare(
+            cacheMode=2, golden=self.GoldenType.NPU_SMALL_OPS,
+            dtype=torch.bfloat16, seed=SEED, rope_style="interleaved",
+        )
+
+    def test_mla_preprocess_ops_bf16_cachemode2_golden2_rope_interleaved(self):
+        self.run_tests_and_compare(
+            cacheMode=2, golden=self.GoldenType.PYTORCH_NATIVE,
+            dtype=torch.bfloat16, seed=SEED, rope_style="interleaved",
+        )
+
+    def test_mla_preprocess_ops_bf16_cachemode3_golden1_rope_interleaved(self):
+        self.run_tests_and_compare(
+            cacheMode=3, golden=self.GoldenType.NPU_SMALL_OPS,
+            dtype=torch.bfloat16, seed=SEED, rope_style="interleaved",
+        )
+
+    def test_mla_preprocess_ops_bf16_cachemode3_golden2_rope_interleaved(self):
+        self.run_tests_and_compare(
+            cacheMode=3, golden=self.GoldenType.PYTORCH_NATIVE,
+            dtype=torch.bfloat16, seed=SEED, rope_style="interleaved",
+        )
+
+    def test_mla_preprocess_ops_fp16_cachemode1_golden1_rope_interleaved(self):
+        self.run_tests_and_compare(
+            cacheMode=1, golden=self.GoldenType.NPU_SMALL_OPS,
+            dtype=torch.float16, seed=SEED, rope_style="interleaved",
+        )
+
+    def test_mla_preprocess_ops_fp16_cachemode1_golden2_rope_interleaved(self):
+        self.run_tests_and_compare(
+            cacheMode=1, golden=self.GoldenType.PYTORCH_NATIVE,
+            dtype=torch.float16, seed=SEED, rope_style="interleaved",
+        )
+
 
 if __name__ == "__main__":
     run_tests()
