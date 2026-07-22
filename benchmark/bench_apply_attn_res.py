@@ -8,8 +8,19 @@ import torch
 import torch.nn as nn
 import torch_npu
 
-from sgl_kernel_npu.activation.apply_attn_res import apply_attn_res
-from sgl_kernel_npu.activation.apply_attn_res import apply_attn_res_native  # if not exported, inline ref
+from sgl_kernel_npu.norm.apply_attn_res import apply_attn_res
+
+
+def apply_attn_res_native(prefix_sum, block_residual, proj_weight, norm_weight, eps):
+    """Reference — mirrors modeling_kimi.py _apply_attn_res."""
+    v = torch.cat((block_residual, prefix_sum.unsqueeze(1)), dim=1)
+    v_f = v.float()
+    variance = v_f.pow(2).mean(-1, keepdim=True)
+    k = v_f * torch.rsqrt(variance + eps)
+    score_weight = norm_weight.float() * proj_weight.float()
+    scores = (k * score_weight).sum(-1)
+    probs = scores.softmax(-1).unsqueeze(1)
+    return torch.matmul(probs, v_f).squeeze(1).to(v.dtype)
 
 
 def _bench(fn, warmup=5, iters=30):

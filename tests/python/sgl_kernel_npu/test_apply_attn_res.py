@@ -4,7 +4,7 @@ import torch
 import torch.nn as nn
 import torch_npu
 
-from sgl_kernel_npu.activation.apply_attn_res import apply_attn_res
+from sgl_kernel_npu.norm.apply_attn_res import apply_attn_res
 
 
 def apply_attn_res_native(prefix_sum, block_residual, proj_weight, norm_weight, eps):
