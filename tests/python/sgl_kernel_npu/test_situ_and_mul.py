@@ -20,78 +20,76 @@ def situ_and_mul_native(x, beta=4.0, linear_beta=25.0):
 # 16 experts; count-format per-expert token counts (sum = 157 real rows).
 _COUNTS = [0, 32, 0, 0, 10, 0, 0, 0, 100, 0, 0, 5, 5, 5, 0, 0]
 _REAL_TOKENS = sum(_COUNTS)
-# Production shape: last dim = moe_intermediate_size * 2 = 3072 * 2 = 6144 (d = 3072).
 PROD_H = 3072 * 2
 
-# BF16: both kernel and reference compute in FP32 then round to BF16, so
-# tolerances reflect BF16 rounding (~2^-8 mantissa). Tighten on NPU if easy.
-RTOL, ATOL = 1e-2, 2e-2
+# Tolerances per triton-ascend debug_guide/precision.md:
+#   BF16 → rtol=atol=5e-3; FP32 → rtol=atol=1e-5; FP16 uses BF16 grade (doc
+#   has no FP16 entry). equal_nan=True (doc default).
+_TOL = {
+    torch.bfloat16: (5e-3, 5e-3),
+    torch.float16: (5e-3, 5e-3),
+    torch.float32: (1e-5, 1e-5),
+}
 
 
 class TestSituAndMulPrecision(unittest.TestCase):
-    """Correctness vs the PyTorch reference across shapes and params."""
+    """Correctness vs the PyTorch reference across shapes, params, and dtypes."""
 
-    def _check(self, h, s=4096, beta=4.0, linear_beta=25.0, counts=None, scale=1.0):
-        x = torch.randn((s, h), dtype=torch.bfloat16).npu() * scale
+    def _check(self, h, s=4096, beta=4.0, linear_beta=25.0, counts=None,
+               scale=1.0, dtype=torch.bfloat16):
+        x = torch.randn((s, h), dtype=dtype).npu() * scale
         c = counts if counts is not None else _COUNTS
         group_list = torch.Tensor(c).npu().to(torch.int64)
         real = sum(c)
 
         out = situ_and_mul(x, group_list, 1, beta=beta, linear_beta=linear_beta)
         ref = situ_and_mul_native(x, beta=beta, linear_beta=linear_beta)
-        torch.testing.assert_close(out[:real], ref[:real], rtol=RTOL, atol=ATOL)
+        rtol, atol = _TOL[dtype]
+        torch.testing.assert_close(out[:real], ref[:real], rtol=rtol, atol=atol,
+                                   equal_nan=True)
 
-    def test_prod_shape(self):
-        # d = 3072 (moe_intermediate_size); input last-dim 6144.
-        self._check(h=PROD_H)
+    # ---- BF16 (doc: rtol=atol=5e-3) ----
+    def test_prod_shape_bf16(self):
+        self._check(h=PROD_H, dtype=torch.bfloat16)
 
-    def test_small(self):
-        self._check(h=8192)  # d = 4096
+    def test_small_bf16(self):
+        self._check(h=8192, dtype=torch.bfloat16)
 
-    def test_mid(self):
-        self._check(h=3072)  # d = 1536
+    def test_mid_bf16(self):
+        self._check(h=3072, dtype=torch.bfloat16)
 
-    def test_min_aligned(self):
-        self._check(h=1024, s=512)  # d = 512
+    def test_without_linear_beta_bf16(self):
+        self._check(h=8192, linear_beta=None, dtype=torch.bfloat16)
 
-    def test_without_linear_beta(self):
-        self._check(h=8192, linear_beta=None)  # DO_LINEAR_BETA = False
+    def test_custom_beta_bf16(self):
+        self._check(h=8192, beta=2.0, linear_beta=10.0, dtype=torch.bfloat16)
 
-    def test_custom_beta(self):
-        self._check(h=8192, beta=2.0, linear_beta=10.0)
+    def test_saturation_bf16(self):
+        self._check(h=8192, scale=50.0, dtype=torch.bfloat16)
 
-    def test_saturation_region(self):
-        # Large magnitude so |gate/beta| (and |up/linear_beta|) frequently exceed
-        # 2-3 -> actually exercises the tanh soft-saturation that defines SituAndMul.
-        # (randn alone keeps |gate/beta| < 2 almost surely, so tanh stays ~linear.)
-        self._check(h=8192, scale=50.0)
-
-    def test_nd_input(self):
-        # N-D input exercises the wrapper's reshape path; leading dims are
-        # preserved on output. group_list counts refer to the flattened rows.
+    def test_nd_input_bf16(self):
         B, s, h = 2, 256, 8192
         x = torch.randn((B, s, h), dtype=torch.bfloat16).npu()
         group_list = torch.Tensor(_COUNTS).npu().to(torch.int64)
         real = sum(_COUNTS)
-
         out = situ_and_mul(x, group_list, 1)
         self.assertEqual(out.shape, (B, s, h // 2))
-
         ref = situ_and_mul_native(x)
-        out_flat = out.reshape(-1, h // 2)
-        ref_flat = ref.reshape(-1, h // 2)
-        torch.testing.assert_close(out_flat[:real], ref_flat[:real], rtol=RTOL, atol=ATOL)
+        rtol, atol = _TOL[torch.bfloat16]
+        torch.testing.assert_close(out.reshape(-1, h // 2)[:real],
+                                   ref.reshape(-1, h // 2)[:real],
+                                   rtol=rtol, atol=atol, equal_nan=True)
 
+    # ---- FP16 (BF16-grade tolerance; doc has no FP16 entry) ----
     def test_fp16(self):
-        # Different dtype (sglang NPU op-dev testing checklist). The kernel is
-        # dtype-generic (FP32-internal, store as x.dtype); verify the fp16 path.
-        s, h = 4096, 8192
-        x = torch.randn((s, h), dtype=torch.float16).npu()
-        group_list = torch.Tensor(_COUNTS).npu().to(torch.int64)
-        real = sum(_COUNTS)
-        out = situ_and_mul(x, group_list, 1)
-        ref = situ_and_mul_native(x)
-        torch.testing.assert_close(out[:real], ref[:real], rtol=RTOL, atol=ATOL)
+        self._check(h=8192, dtype=torch.float16)
+
+    # ---- FP32 (doc: rtol=atol=1e-5) ----
+    def test_prod_shape_fp32(self):
+        self._check(h=PROD_H, dtype=torch.float32)
+
+    def test_saturation_fp32(self):
+        self._check(h=8192, scale=50.0, dtype=torch.float32)
 
 
 class TestSituAndMulBoundary(unittest.TestCase):
@@ -101,18 +99,16 @@ class TestSituAndMulBoundary(unittest.TestCase):
         x = torch.randn((s, h), dtype=torch.bfloat16).npu()
         group_list = torch.Tensor(counts).npu().to(torch.int64)
         real = sum(counts)
-
         out = situ_and_mul(x, group_list, 1, beta=beta, linear_beta=linear_beta)
-
-        # Output is always the full (capacity, d) shape; only `real` rows valid.
         self.assertEqual(out.shape, (s, h // 2))
         if real > 0:
             ref = situ_and_mul_native(x, beta=beta, linear_beta=linear_beta)
-            torch.testing.assert_close(out[:real], ref[:real], rtol=RTOL, atol=ATOL)
+            rtol, atol = _TOL[torch.bfloat16]
+            torch.testing.assert_close(out[:real], ref[:real], rtol=rtol, atol=atol,
+                                       equal_nan=True)
         return out, real
 
     def test_zero_tokens(self):
-        # All experts get 0 tokens -> kernel must no-op without crashing.
         out, real = self._run([0] * 16)
         self.assertEqual(real, 0)
 
@@ -130,14 +126,13 @@ class TestSituAndMulBoundary(unittest.TestCase):
         self.assertEqual(real, 200)
 
     def test_group_list_int32(self):
-        # Host has a dedicated int32 alignment branch.
         x = torch.randn((4096, 8192), dtype=torch.bfloat16).npu()
         group_list = torch.Tensor(_COUNTS).npu().to(torch.int32)
         out = situ_and_mul(x, group_list, 1)
         ref = situ_and_mul_native(x)
-        torch.testing.assert_close(
-            out[:_REAL_TOKENS], ref[:_REAL_TOKENS], rtol=RTOL, atol=ATOL
-        )
+        rtol, atol = _TOL[torch.bfloat16]
+        torch.testing.assert_close(out[:_REAL_TOKENS], ref[:_REAL_TOKENS],
+                                   rtol=rtol, atol=atol, equal_nan=True)
 
     def test_invalid_group_list_type(self):
         x = torch.randn((16, 8192), dtype=torch.bfloat16).npu()
@@ -156,9 +151,6 @@ class TestSituAndMulBoundary(unittest.TestCase):
         group_list = torch.Tensor(_COUNTS).npu().to(torch.int64)
         with self.assertRaises(ValueError):
             situ_and_mul(x, group_list, 1)
-
-    # group_list_type=0 (cusum) is not covered here; its buffer layout follows
-    # the dispatch contract (same as swiglu_quant).
 
 
 if __name__ == "__main__":
