@@ -1,22 +1,4 @@
-"""SituAndMul activation (BF16) for Ascend 910C, MoE group_list aware.
-
-Activation math adapted from the PyTorch ``SituAndMul`` in sglang's Kimi-K3
-model; kernel structure mirrors ``sgl_kernel_npu.activation.swiglu_quant``
-(group_list handling, vector-core grid, full-row load + ``al.extract_slice``,
-``multibuffer``, FP32-internal compute) with no quantization.
-
-Per real row (the first ``sum(group_list)`` rows of ``x``), with
-``d = x.shape[-1] // 2``::
-
-    gate   = x[:, :d],  up = x[:, d:]
-    situ_a = beta * tanh(gate / beta) * sigmoid(gate)
-    up     = linear_beta * tanh(up / linear_beta)   # only when linear_beta is set
-    out    = (situ_a * up).to(x.dtype)
-
-``beta`` and ``linear_beta`` are model-config scalars specialized as
-``tl.constexpr``. At the production ``d = moe_intermediate_size = 3072`` a
-full-row FP32 load is ~24 KiB, well within the ~192 KiB Unified Buffer.
-"""
+"""SituAndMul (bounded SwiGLU) BF16 activation for Ascend 910C, group_list aware."""
 
 from typing import Optional
 

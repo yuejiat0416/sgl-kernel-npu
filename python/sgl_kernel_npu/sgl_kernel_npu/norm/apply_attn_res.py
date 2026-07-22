@@ -1,15 +1,4 @@
-"""apply_attn_res (K3 learned attn-residual) BF16 Triton-Ascend kernel for Ascend 910C.
-
-Activation math adapted from the PyTorch ``_apply_attn_res`` in Kimi-K3's
-HuggingFace model (``modeling_kimi.py:1119``); kernel structure mirrors
-``sgl_kernel_npu.activation.swiglu_quant`` (vector-core grid, full-row load +
-``tl.arange``, ``multibuffer``, FP32-internal) with the learned attn-residual
-math. The host wrapper concatenates block_residual + prefix_sum into a single
-``[N, B+1, H]`` tensor so the kernel reads from ONE pointer (Triton-Ascend
-does not support selecting between two different-source pointers in-kernel).
-Softmax is manual (max/exp/sum) because ``tl.softmax`` is not usable on this
-Triton-Ascend version.
-"""
+"""apply_attn_res (K3 learned attn-residual) BF16 kernel for Ascend 910C."""
 
 import torch
 import triton
