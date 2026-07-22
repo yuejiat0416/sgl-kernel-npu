@@ -8,7 +8,6 @@ memory bandwidth (the op is elementwise, so it is memory-bandwidth bound).
 """
 
 import argparse
-import time
 
 import torch
 import torch_npu
@@ -27,14 +26,21 @@ def situ_and_mul_native(x, beta=4.0, linear_beta=25.0):
 
 
 def _bench(fn, warmup=5, iters=30):
+    """Time ``fn`` on-device with NPU events; return the min kernel time (ms)
+    over ``iters`` runs after ``warmup``. Host wall-clock is not used."""
     for _ in range(warmup):
         fn()
     torch.npu.synchronize()
-    t0 = time.perf_counter()
+    start = torch.npu.Event(enable_timing=True)
+    end = torch.npu.Event(enable_timing=True)
+    times = []
     for _ in range(iters):
+        start.record()
         fn()
-    torch.npu.synchronize()
-    return (time.perf_counter() - t0) / iters * 1e3  # ms/op
+        end.record()
+        end.synchronize()
+        times.append(start.elapsed_time(end))  # ms, device-side
+    return min(times)
 
 
 def bench_shape(s, h, beta=4.0, linear_beta=25.0):

@@ -66,6 +66,33 @@ class TestSituAndMulPrecision(unittest.TestCase):
         # (randn alone keeps |gate/beta| < 2 almost surely, so tanh stays ~linear.)
         self._check(h=8192, scale=50.0)
 
+    def test_nd_input(self):
+        # N-D input exercises the wrapper's reshape path; leading dims are
+        # preserved on output. group_list counts refer to the flattened rows.
+        B, s, h = 2, 256, 8192
+        x = torch.randn((B, s, h), dtype=torch.bfloat16).npu()
+        group_list = torch.Tensor(_COUNTS).npu().to(torch.int64)
+        real = sum(_COUNTS)
+
+        out = situ_and_mul(x, group_list, 1)
+        self.assertEqual(out.shape, (B, s, h // 2))
+
+        ref = situ_and_mul_native(x)
+        out_flat = out.reshape(-1, h // 2)
+        ref_flat = ref.reshape(-1, h // 2)
+        torch.testing.assert_close(out_flat[:real], ref_flat[:real], rtol=RTOL, atol=ATOL)
+
+    def test_fp16(self):
+        # Different dtype (sglang NPU op-dev testing checklist). The kernel is
+        # dtype-generic (FP32-internal, store as x.dtype); verify the fp16 path.
+        s, h = 4096, 8192
+        x = torch.randn((s, h), dtype=torch.float16).npu()
+        group_list = torch.Tensor(_COUNTS).npu().to(torch.int64)
+        real = sum(_COUNTS)
+        out = situ_and_mul(x, group_list, 1)
+        ref = situ_and_mul_native(x)
+        torch.testing.assert_close(out[:real], ref[:real], rtol=RTOL, atol=ATOL)
+
 
 class TestSituAndMulBoundary(unittest.TestCase):
     """Edge cases: token-count boundaries, dtypes, and input validation."""
@@ -135,4 +162,4 @@ class TestSituAndMulBoundary(unittest.TestCase):
 
 
 if __name__ == "__main__":
-    unittest.main()
+    unittest.main(verbosity=2)

@@ -1,8 +1,9 @@
 """SituAndMul activation (BF16) for Ascend 910C, MoE group_list aware.
 
-Mirrors ``sgl_kernel_npu.activation.swiglu_quant`` (group_list handling,
-vector-core grid, full-row load + ``al.extract_slice``, ``multibuffer``,
-FP32-internal compute) with the SituAndMul activation and no quantization.
+Activation math adapted from the PyTorch ``SituAndMul`` in sglang's Kimi-K3
+model; kernel structure mirrors ``sgl_kernel_npu.activation.swiglu_quant``
+(group_list handling, vector-core grid, full-row load + ``al.extract_slice``,
+``multibuffer``, FP32-internal compute) with no quantization.
 
 Per real row (the first ``sum(group_list)`` rows of ``x``), with
 ``d = x.shape[-1] // 2``::
@@ -16,6 +17,8 @@ Per real row (the first ``sum(group_list)`` rows of ``x``), with
 ``tl.constexpr``. At the production ``d = moe_intermediate_size = 3072`` a
 full-row FP32 load is ~24 KiB, well within the ~192 KiB Unified Buffer.
 """
+
+from typing import Optional
 
 import torch
 import triton
@@ -85,7 +88,7 @@ def situ_and_mul(
     group_list,
     group_list_type,
     beta: float = 4.0,
-    linear_beta: float = 25.0,
+    linear_beta: Optional[float] = 25.0,
 ):
     """SituAndMul activation with MoE group_list.
 
