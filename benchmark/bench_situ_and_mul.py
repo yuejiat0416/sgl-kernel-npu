@@ -26,7 +26,7 @@ def situ_and_mul_native(x, beta=4.0, linear_beta=25.0):
 
 
 def _bench(fn, warmup=5, iters=30):
-    """Time ``fn`` on-device with NPU events; return the min kernel time (ms)
+    """Time ``fn`` on-device with NPU events; return the min kernel time (us)
     over ``iters`` runs after ``warmup``. Host wall-clock is not used."""
     for _ in range(warmup):
         fn()
@@ -39,7 +39,7 @@ def _bench(fn, warmup=5, iters=30):
         fn()
         end.record()
         end.synchronize()
-        times.append(start.elapsed_time(end))  # ms, device-side
+        times.append(start.elapsed_time(end) * 1000.0)  # us, device-side
     return min(times)
 
 
@@ -52,11 +52,11 @@ def bench_shape(s, h, beta=4.0, linear_beta=25.0):
 
     t_native = _bench(lambda: situ_and_mul_native(x, beta, linear_beta))
     t_kernel = _bench(lambda: situ_and_mul(x, group_list, 1, beta, linear_beta))
-    bw = bytes_moved / (t_kernel * 1e-3) / 1e9  # GB/s
+    bw = bytes_moved / (t_kernel * 1e-6) / 1e9  # GB/s (t_kernel in us)
 
     print(
         f"[s={s:>5}, h={h:>6}, d={h // 2:>6}] "
-        f"kernel={t_kernel:8.3f} ms  native={t_native:8.3f} ms  "
+        f"kernel={t_kernel:8.1f} us  native={t_native:8.1f} us  "
         f"speedup={t_native / t_kernel:5.2f}x  bw={bw:7.1f} GB/s"
     )
 
@@ -72,10 +72,10 @@ def bench_partial(s, h, beta=4.0, linear_beta=25.0):
     real = sum(_PARTIAL_COUNTS)
     bytes_moved = real * (h * 2 + (h // 2) * 2)  # only real rows do work
     t_kernel = _bench(lambda: situ_and_mul(x, group_list, 1, beta, linear_beta))
-    bw = bytes_moved / (t_kernel * 1e-3) / 1e9  # GB/s
+    bw = bytes_moved / (t_kernel * 1e-6) / 1e9  # GB/s (t_kernel in us)
     print(
         f"[partial s={s:>5}, real={real:>4}, h={h:>6}] "
-        f"kernel={t_kernel:8.3f} ms  useful_bw={bw:7.1f} GB/s"
+        f"kernel={t_kernel:8.1f} us  useful_bw={bw:7.1f} GB/s"
     )
 
 
@@ -91,6 +91,8 @@ def main():
     bench_shape(args.capacity, args.prod_h)  # prod: d = 3072 (default --prod-h 6144)
     bench_shape(2048, 8192)                  # nearby d = 4096
     bench_shape(512, 6144)                   # small capacity, prod d = 3072
+    bench_shape(1, args.prod_h)              # N=1: single decode token (launch overhead)
+    bench_shape(32768, args.prod_h)          # N=32768: large prefill (bandwidth saturation)
     print("-- partial utilization (realistic MoE dispatch) --")
     bench_partial(args.capacity, args.prod_h)
 

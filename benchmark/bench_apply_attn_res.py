@@ -69,3 +69,6 @@ if __name__ == "__main__":
     bench_shape(N=4096, B=8)   # late-layer (B=8, 9 streams)
     bench_shape(N=4096, B=4)   # mid-layer
     bench_shape(N=4096, B=1)   # early-layer
+    bench_shape(N=1, B=8)      # N=1: single decode token (max streams)
+    bench_shape(N=32768, B=8)  # N=32768: large prefill
+    bench_shape(N=4096, B=0)   # B=0: first layer (identity)
