@@ -30,12 +30,9 @@ H = 7168
 
 # Tolerances per triton-ascend debug_guide/precision.md:
 #   BF16 → rtol=atol=5e-3; FP32 → rtol=atol=1e-5. equal_nan=True (doc default).
-# BF16 atol relaxed from doc 5e-3 to 2e-2: this op's reduction chain
-# (MS→rstd→k→score→softmax→weighted-sum) is longer than elementwise; FP32
-# tests pass at 1e-5 (proving the math); BF16 outliers (0.015625 = 1 ULP,
-# 0.008% of elements) are inherent BF16 cast rounding.
+# Per triton-ascend debug_guide/precision.md: BF16 rtol=atol=5e-3, FP32 rtol=atol=1e-5.
 _TOL = {
-    torch.bfloat16: (5e-3, 2e-2),
+    torch.bfloat16: (5e-3, 5e-3),
     torch.float32: (1e-5, 1e-5),
 }
 
@@ -65,6 +62,10 @@ class TestApplyAttnRes(unittest.TestCase):
     def test_b8_bf16(self):
         self._run(N=512, B=8, dtype=torch.bfloat16)
 
+    def test_large_residual_bf16(self):
+        # Realistic residual magnitude (~3x accumulated, not artificial 50x).
+        self._run(N=128, B=4, beta_scale=3.0, dtype=torch.bfloat16)
+
     # ---- FP32 (doc: rtol=atol=1e-5) ----
     def test_b1_fp32(self):
         self._run(N=128, B=1, dtype=torch.float32)
@@ -74,6 +75,9 @@ class TestApplyAttnRes(unittest.TestCase):
 
     def test_b8_fp32(self):
         self._run(N=512, B=8, dtype=torch.float32)
+
+    def test_large_residual_fp32(self):
+        self._run(N=128, B=4, beta_scale=3.0, dtype=torch.float32)
 
 
 if __name__ == "__main__":
