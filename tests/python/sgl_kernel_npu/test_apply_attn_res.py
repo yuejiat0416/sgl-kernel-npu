@@ -7,16 +7,24 @@ import torch_npu
 from sgl_kernel_npu.norm.apply_attn_res import apply_attn_res
 
 
-def apply_attn_res_native(prefix_sum, block_residual, proj_weight, norm_weight, eps):
-    """Reference — mirrors modeling_kimi.py _apply_attn_res (line 1119)."""
-    v = torch.cat((block_residual, prefix_sum.unsqueeze(1)), dim=1)  # [N, B+1, H]
-    v_f = v.float()
-    variance = v_f.pow(2).mean(-1, keepdim=True)
-    k = v_f * torch.rsqrt(variance + eps)
+def apply_attn_res_native(prefix_sum, block_residual, proj_weight, norm_weight, eps,
+                          chunk=1024):
+    """Reference — mirrors modeling_kimi.py _apply_attn_res. Chunked over the
+    token axis to bound peak memory; the op is token-independent, so chunking
+    is bit-exact (each token's RMSNorm / softmax / weighted-sum is independent)."""
+    N, H = prefix_sum.shape
     score_weight = norm_weight.float() * proj_weight.float()
-    scores = (k * score_weight).sum(-1)
-    probs = scores.softmax(-1).unsqueeze(1)
-    return torch.matmul(probs, v_f).squeeze(1).to(v.dtype)
+    out = torch.empty((N, H), dtype=prefix_sum.dtype, device=prefix_sum.device)
+    for i in range(0, N, chunk):
+        br = block_residual[i:i + chunk]                   # [c, B, H]
+        ps = prefix_sum[i:i + chunk].unsqueeze(1)          # [c, 1, H]
+        v = torch.cat((br, ps), dim=1).float()             # [c, B+1, H] FP32
+        variance = v.pow(2).mean(-1, keepdim=True)
+        k = v * torch.rsqrt(variance + eps)
+        scores = (k * score_weight).sum(-1)                # [c, B+1]
+        probs = scores.softmax(-1).unsqueeze(1)            # [c, 1, B+1]
+        out[i:i + chunk] = torch.matmul(probs, v).squeeze(1).to(out.dtype)
+    return out
 
 
 class _FakeNorm:
@@ -29,19 +37,32 @@ class _FakeNorm:
 H = 7168
 
 # Tolerances per triton-ascend debug_guide/precision.md:
-#   BF16 → rtol=atol=5e-3; FP32 → rtol=atol=1e-5. equal_nan=True (doc default).
-# Per triton-ascend debug_guide/precision.md: BF16 rtol=atol=5e-3, FP32 rtol=atol=1e-5.
+#   BF16 -> rtol=atol=5e-3; FP32 -> rtol=atol=1e-5. equal_nan=True (doc default).
 _TOL = {
     torch.bfloat16: (5e-3, 5e-3),
     torch.float32: (1e-5, 1e-5),
 }
 
+# Grid. N spans a single decode token (1) up to a large prefill (~8k); B spans
+# the residual-snapshot counts that occur across K3 (93 layers; a snapshot is
+# appended every attn_res_block_size=12 layers => 8 blocks; B grows 1..8, max 8
+# = 9 streams at the final mix; B=0 is guarded out at layer 0). So B in {1,4,8}
+# = early / mid / max, all real values.
+# FP32 is the math-correctness witness only (not the deployment dtype), so its N
+# is capped: FP32 inputs at N=8k, B=8 need ~4 GiB, too much for this shared NPU
+# (~2-4 GiB free for our process). BF16 is the deployment dtype and runs the full
+# range (half-size inputs, fits).
+_N_GRID_BF16 = (1, 64, 256, 1024, 4096, 8000)
+_N_GRID_FP32 = (1, 64, 256, 1024)
+_B_GRID = (1, 4, 8)
+
 
 class TestApplyAttnRes(unittest.TestCase):
-    def _run(self, N, B, beta_scale=1.0, dtype=torch.bfloat16):
+    def _run(self, N, B, dtype=torch.bfloat16):
+        torch.npu.empty_cache()
         torch.manual_seed(0)
-        prefix_sum = (torch.randn(N, H, dtype=dtype).npu() * beta_scale)
-        block_residual = (torch.randn(N, B, H, dtype=dtype).npu() * beta_scale)
+        prefix_sum = torch.randn(N, H, dtype=dtype).npu()
+        block_residual = torch.randn(N, B, H, dtype=dtype).npu()
         proj = nn.Linear(H, 1, bias=False).to(dtype).npu()
         norm_w = torch.randn(H, dtype=dtype).npu()
         norm = _FakeNorm(norm_w, 1e-5)
@@ -52,32 +73,23 @@ class TestApplyAttnRes(unittest.TestCase):
         rtol, atol = _TOL[dtype]
         torch.testing.assert_close(out, ref, rtol=rtol, atol=atol, equal_nan=True)
 
-    # ---- BF16 (doc: rtol=atol=5e-3) ----
-    def test_b1_bf16(self):
-        self._run(N=128, B=1, dtype=torch.bfloat16)
 
-    def test_b4_bf16(self):
-        self._run(N=256, B=4, dtype=torch.bfloat16)
+def _case(N, B, dtype):
+    def test(self):
+        self._run(N=N, B=B, dtype=dtype)
+    return test
 
-    def test_b8_bf16(self):
-        self._run(N=512, B=8, dtype=torch.bfloat16)
 
-    def test_large_residual_bf16(self):
-        # Realistic residual magnitude (~3x accumulated, not artificial 50x).
-        self._run(N=128, B=4, beta_scale=3.0, dtype=torch.bfloat16)
-
-    # ---- FP32 (doc: rtol=atol=1e-5) ----
-    def test_b1_fp32(self):
-        self._run(N=128, B=1, dtype=torch.float32)
-
-    def test_b4_fp32(self):
-        self._run(N=256, B=4, dtype=torch.float32)
-
-    def test_b8_fp32(self):
-        self._run(N=512, B=8, dtype=torch.float32)
-
-    def test_large_residual_fp32(self):
-        self._run(N=128, B=4, beta_scale=3.0, dtype=torch.float32)
+# One collected pytest item per (N, B, dtype) — the full cross-product, so a
+# failure pins the exact shape instead of collapsing into one method.
+for _N in _N_GRID_BF16:
+    for _B in _B_GRID:
+        setattr(TestApplyAttnRes, f"test_bf16_N{_N}_B{_B}",
+                _case(_N, _B, torch.bfloat16))
+for _N in _N_GRID_FP32:
+    for _B in _B_GRID:
+        setattr(TestApplyAttnRes, f"test_fp32_N{_N}_B{_B}",
+                _case(_N, _B, torch.float32))
 
 
 if __name__ == "__main__":
