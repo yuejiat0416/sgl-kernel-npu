@@ -47,9 +47,9 @@ def _apply_attn_res_kernel(
         for s in range(B + 1):
             v = tl.load(v_ptr + tok * (B + 1) * H + s * H + cols).to(tl.float32)
             ms = tl.sum(v * v) / H
-            vw = tl.sum(v * w)
             rstd = tl.rsqrt(ms + EPS)
-            scores = tl.where(s_idx == s, rstd * vw, scores)
+            k = v * rstd  # normalize first (matches reference FP32 path exactly)
+            scores = tl.where(s_idx == s, tl.sum(k * w), scores)
 
         # ---- softmax (manual: tl.max + tl.exp + tl.sum; tl.softmax unusable) ----
         scores_max = tl.max(scores)
