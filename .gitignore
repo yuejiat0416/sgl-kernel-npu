@@ -10,6 +10,9 @@ output/
 **/vendors/
 **/build_config.py
 
+# macOS
+.DS_Store
+
 # Prerequisites
 *.d
 
