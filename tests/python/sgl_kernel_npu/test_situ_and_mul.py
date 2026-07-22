@@ -17,7 +17,7 @@ def situ_and_mul_native(x, beta=4.0, linear_beta=25.0):
     return (situ_a * up).to(x.dtype)
 
 
-# 16 experts; count-format per-expert token counts (sum = 162 real rows).
+# 16 experts; count-format per-expert token counts (sum = 157 real rows).
 _COUNTS = [0, 32, 0, 0, 10, 0, 0, 0, 100, 0, 0, 5, 5, 5, 0, 0]
 _REAL_TOKENS = sum(_COUNTS)
 # Production shape: last dim = moe_intermediate_size * 2 = 3072 * 2 = 6144 (d = 3072).
@@ -31,8 +31,8 @@ RTOL, ATOL = 1e-2, 2e-2
 class TestSituAndMulPrecision(unittest.TestCase):
     """Correctness vs the PyTorch reference across shapes and params."""
 
-    def _check(self, h, s=4096, beta=4.0, linear_beta=25.0, counts=None):
-        x = torch.randn((s, h), dtype=torch.bfloat16).npu()
+    def _check(self, h, s=4096, beta=4.0, linear_beta=25.0, counts=None, scale=1.0):
+        x = torch.randn((s, h), dtype=torch.bfloat16).npu() * scale
         c = counts if counts is not None else _COUNTS
         group_list = torch.Tensor(c).npu().to(torch.int64)
         real = sum(c)
@@ -59,6 +59,12 @@ class TestSituAndMulPrecision(unittest.TestCase):
 
     def test_custom_beta(self):
         self._check(h=8192, beta=2.0, linear_beta=10.0)
+
+    def test_saturation_region(self):
+        # Large magnitude so |gate/beta| (and |up/linear_beta|) frequently exceed
+        # 2-3 -> actually exercises the tanh soft-saturation that defines SituAndMul.
+        # (randn alone keeps |gate/beta| < 2 almost surely, so tanh stays ~linear.)
+        self._check(h=8192, scale=50.0)
 
 
 class TestSituAndMulBoundary(unittest.TestCase):
@@ -124,9 +130,8 @@ class TestSituAndMulBoundary(unittest.TestCase):
         with self.assertRaises(ValueError):
             situ_and_mul(x, group_list, 1)
 
-    # NOTE: group_list_type=0 (cusum) is not unit-tested here. Its buffer layout
-    # (where the running total lives relative to num_experts) is a pipeline
-    # contract; validate it against the real dispatch group_list once confirmed.
+    # group_list_type=0 (cusum) is not covered here; its buffer layout follows
+    # the dispatch contract (same as swiglu_quant).
 
 
 if __name__ == "__main__":

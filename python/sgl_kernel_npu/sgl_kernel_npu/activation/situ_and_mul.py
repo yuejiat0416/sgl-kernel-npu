@@ -1,32 +1,27 @@
 """SituAndMul activation (BF16) for Ascend 910C, MoE group_list aware.
 
-Structure (group_list handling, vector-core grid, full-row load +
-``al.extract_slice``, ``multibuffer``, FP32-internal compute) is a direct mirror
-of ``sgl_kernel_npu.activation.swiglu_quant``; the activation math is SituAndMul
-and the quantization path is removed.
+Mirrors ``sgl_kernel_npu.activation.swiglu_quant`` (group_list handling,
+vector-core grid, full-row load + ``al.extract_slice``, ``multibuffer``,
+FP32-internal compute) with the SituAndMul activation and no quantization.
 
-Per real row (the first ``sum(group_list)`` rows of ``x``):
+Per real row (the first ``sum(group_list)`` rows of ``x``), with
+``d = x.shape[-1] // 2``::
 
-    gate = x[:, :d],  up = x[:, d:]          # d = x.shape[-1] // 2 (halves layout)
+    gate   = x[:, :d],  up = x[:, d:]
     situ_a = beta * tanh(gate / beta) * sigmoid(gate)
     up     = linear_beta * tanh(up / linear_beta)   # only when linear_beta is set
-    out    = (situ_a * up)                    # cast back to x.dtype (BF16)
+    out    = (situ_a * up).to(x.dtype)
 
-``beta`` / ``linear_beta`` are model-config scalars passed by the framework at
-call time and specialized as ``tl.constexpr`` (one cached kernel per
-(beta, linear_beta) tuple; the compiler folds ``1/beta`` and eliminates the
-``DO_LINEAR_BETA`` branch).
-
-A full-row FP32 load is ~24 KiB at the production d = moe_intermediate_size =
-3072 (input last-dim 6144), well within the ~192 KiB Unified Buffer, so the
-swiglu_quant full-row-load pattern is kept verbatim. For a much larger d that
-would overflow the UB, the kernel would need a column-tiling inner loop instead.
+``beta`` and ``linear_beta`` are model-config scalars specialized as
+``tl.constexpr``. At the production ``d = moe_intermediate_size = 3072`` a
+full-row FP32 load is ~24 KiB, well within the ~192 KiB Unified Buffer.
 """
 
 import torch
 import triton
 import triton.language as tl
 import triton.language.extra.cann.extension as al
+import triton.language.extra.cann.libdevice as libdevice
 
 from sgl_kernel_npu.utils.triton_utils import get_device_properties
 
@@ -73,10 +68,11 @@ def _situ_and_mul_kernel(
             cur_x, offsets=(HALF_COLS,), sizes=(HALF_COLS,), strides=(1,)
         )
 
-        # SituAndMul gate path: beta * tanh(gate / beta) * sigmoid(gate).
-        situ_a = BETA * tl.tanh(gate * INV_BETA) * tl.sigmoid(gate)
+        # situ_a = beta * tanh(gate / beta) * sigmoid(gate). tl.tanh is
+        # unavailable on Ascend, so tanh uses the CANN libdevice lowering.
+        situ_a = BETA * libdevice.tanh(gate * INV_BETA) * tl.sigmoid(gate)
         if DO_LINEAR_BETA:
-            up = LINEAR_BETA * tl.tanh(up * INV_LINEAR_BETA)
+            up = LINEAR_BETA * libdevice.tanh(up * INV_LINEAR_BETA)
         out = situ_a * up
 
         # store out

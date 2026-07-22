@@ -55,6 +55,24 @@ def bench_shape(s, h, beta=4.0, linear_beta=25.0):
     )
 
 
+# Partial utilization: ~157 real rows out of a much larger capacity (one token
+# per expert block), the realistic MoE-dispatch case where many vector cores idle.
+_PARTIAL_COUNTS = [0, 32, 0, 0, 10, 0, 0, 0, 100, 0, 0, 5, 5, 5, 0, 0]  # sum 157
+
+
+def bench_partial(s, h, beta=4.0, linear_beta=25.0):
+    x = torch.randn((s, h), dtype=torch.bfloat16).npu()
+    group_list = torch.Tensor(_PARTIAL_COUNTS).npu().to(torch.int64)
+    real = sum(_PARTIAL_COUNTS)
+    bytes_moved = real * (h * 2 + (h // 2) * 2)  # only real rows do work
+    t_kernel = _bench(lambda: situ_and_mul(x, group_list, 1, beta, linear_beta))
+    bw = bytes_moved / (t_kernel * 1e-3) / 1e9  # GB/s
+    print(
+        f"[partial s={s:>5}, real={real:>4}, h={h:>6}] "
+        f"kernel={t_kernel:8.3f} ms  useful_bw={bw:7.1f} GB/s"
+    )
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--capacity", type=int, default=4096)
@@ -62,9 +80,13 @@ def main():
     args = parser.parse_args()
 
     print("=== SituAndMul BF16 (Ascend 910C) ===")
-    bench_shape(args.capacity, args.prod_h)  # production: d = moe_intermediate_size
-    bench_shape(2048, 8192)
-    bench_shape(512, 32768)
+    print("-- full capacity --")
+    # Production-aligned: d = moe_intermediate_size = 3072 (input last-dim 6144).
+    bench_shape(args.capacity, args.prod_h)  # prod: d = 3072 (default --prod-h 6144)
+    bench_shape(2048, 8192)                  # nearby d = 4096
+    bench_shape(512, 6144)                   # small capacity, prod d = 3072
+    print("-- partial utilization (realistic MoE dispatch) --")
+    bench_partial(args.capacity, args.prod_h)
 
 
 if __name__ == "__main__":
