@@ -53,7 +53,7 @@ def _apply_attn_res_kernel(
             scores = tl.where(s_idx == s, rstd * vw, scores)
 
         # ---- softmax over B+1 (pad slots are -inf -> weight 0) ----
-        weights = tl.softmax(scores, axis=0)
+        weights = tl.softmax(scores, dim=0)
 
         # ---- pass 2: weighted sum of raw streams (full-row reload) ----
         out = tl.zeros([H], dtype=tl.float32)
