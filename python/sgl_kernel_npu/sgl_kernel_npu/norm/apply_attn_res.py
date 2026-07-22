@@ -1,5 +1,3 @@
-"""apply_attn_res (K3 learned attn-residual) BF16 kernel for Ascend 910C."""
-
 import torch
 import triton
 import triton.language as tl
