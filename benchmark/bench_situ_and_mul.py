@@ -3,8 +3,9 @@
 Run on an NPU host:
     python benchmark/bench_situ_and_mul.py
 
-Reports per-shape kernel time, speedup over the PyTorch reference, and achieved
-memory bandwidth (the op is elementwise, so it is memory-bandwidth bound).
+Covers both call shapes: dense (group_list=None, KimiMLP layer0/shared) and routed
+(group_list, MoE routed experts). Reports per-shape kernel time (us, NPU events),
+speedup over the PyTorch reference, and achieved memory bandwidth (elementwise -> BW-bound).
 """
 
 import argparse
@@ -43,26 +44,34 @@ def _bench(fn, warmup=5, iters=30):
     return min(times)
 
 
+def _report(tag, t_kernel, t_native, rows, h):
+    # read 2d per row, write d per row (BF16).
+    bytes_moved = rows * (h * 2 + (h // 2) * 2)
+    bw = bytes_moved / (t_kernel * 1e-6) / 1e9  # GB/s (t_kernel in us)
+    native_str = f"native={t_native:8.1f} us  speedup={t_native / t_kernel:5.2f}x" if t_native else "n/a"
+    print(f"[{tag}] kernel={t_kernel:8.1f} us  {native_str}  bw={bw:7.1f} GB/s")
+
+
+def bench_dense(N, d, beta=4.0, linear_beta=25.0):
+    # group_list=None: dense KimiMLP (layer0 / shared) -- ALL rows processed.
+    h = 2 * d
+    x = torch.randn((N, h), dtype=torch.bfloat16).npu()
+    t_native = _bench(lambda: situ_and_mul_native(x, beta, linear_beta))
+    t_kernel = _bench(lambda: situ_and_mul(x))                       # dense path
+    _report(f"dense   N={N:>5}, d={d:>6}", t_kernel, t_native, N, h)
+
+
 def bench_shape(s, h, beta=4.0, linear_beta=25.0):
-    # Full capacity: one expert holds all rows -> all rows are real.
+    # Routed, full capacity: one expert holds all rows -> all rows are real.
     x = torch.randn((s, h), dtype=torch.bfloat16).npu()
     group_list = torch.Tensor([s] + [0] * 15).npu().to(torch.int64)
-    # bf16: read 2d per row, write d per row.
-    bytes_moved = s * (h * 2 + (h // 2) * 2)
-
     t_native = _bench(lambda: situ_and_mul_native(x, beta, linear_beta))
     t_kernel = _bench(lambda: situ_and_mul(x, group_list, 1, beta, linear_beta))
-    bw = bytes_moved / (t_kernel * 1e-6) / 1e9  # GB/s (t_kernel in us)
-
-    print(
-        f"[s={s:>5}, h={h:>6}, d={h // 2:>6}] "
-        f"kernel={t_kernel:8.1f} us  native={t_native:8.1f} us  "
-        f"speedup={t_native / t_kernel:5.2f}x  bw={bw:7.1f} GB/s"
-    )
+    _report(f"routed  s={s:>5}, d={h // 2:>6}", t_kernel, t_native, s, h)
 
 
-# Partial utilization: ~157 real rows out of a much larger capacity (one token
-# per expert block), the realistic MoE-dispatch case where many vector cores idle.
+# Partial utilization: ~157 real rows out of a much larger capacity (realistic MoE dispatch
+# where many vector cores idle). Useful-work BW only counts the real rows.
 _PARTIAL_COUNTS = [0, 32, 0, 0, 10, 0, 0, 0, 100, 0, 0, 5, 5, 5, 0, 0]  # sum 157
 
 
@@ -70,13 +79,8 @@ def bench_partial(s, h, beta=4.0, linear_beta=25.0):
     x = torch.randn((s, h), dtype=torch.bfloat16).npu()
     group_list = torch.Tensor(_PARTIAL_COUNTS).npu().to(torch.int64)
     real = sum(_PARTIAL_COUNTS)
-    bytes_moved = real * (h * 2 + (h // 2) * 2)  # only real rows do work
     t_kernel = _bench(lambda: situ_and_mul(x, group_list, 1, beta, linear_beta))
-    bw = bytes_moved / (t_kernel * 1e-6) / 1e9  # GB/s (t_kernel in us)
-    print(
-        f"[partial s={s:>5}, real={real:>4}, h={h:>6}] "
-        f"kernel={t_kernel:8.1f} us  useful_bw={bw:7.1f} GB/s"
-    )
+    _report(f"partial s={s:>5}, real={real:>4}, d={h // 2:>6}", t_kernel, None, real, h)
 
 
 def main():
@@ -86,14 +90,19 @@ def main():
     args = parser.parse_args()
 
     print("=== SituAndMul BF16 (Ascend 910C) ===")
-    print("-- full capacity --")
-    # Production-aligned: d = moe_intermediate_size = 3072 (input last-dim 6144).
-    bench_shape(args.capacity, args.prod_h)  # prod: d = 3072 (default --prod-h 6144)
-    bench_shape(2048, 8192)                  # nearby d = 4096
-    bench_shape(512, 6144)                   # small capacity, prod d = 3072
+    print("-- dense (group_list=None: KimiMLP layer0 / shared) --")
+    bench_dense(1, 3072)        # decode, routed-sized d
+    bench_dense(args.capacity, 3072)   # prefill, routed d (moe_intermediate_size)
+    bench_dense(1, 6144)        # decode, shared-expert d (num_shared*moe_intermediate)
+    bench_dense(args.capacity, 6144)   # prefill, shared d
+    bench_dense(1, 33792)       # decode, dense layer0 d (H-tiled -- the UB case)
+    bench_dense(512, 33792)     # prefill-ish, dense layer0 d (N capped: [N,67584] is big)
+
+    print("-- routed (group_list: MoE routed experts), full capacity --")
+    bench_shape(args.capacity, args.prod_h)  # prod: d = 3072
     bench_shape(1, args.prod_h)              # N=1: single decode token (launch overhead)
     bench_shape(32768, args.prod_h)          # N=32768: large prefill (bandwidth saturation)
-    print("-- partial utilization (realistic MoE dispatch) --")
+    print("-- routed, partial utilization (realistic MoE dispatch) --")
     bench_partial(args.capacity, args.prod_h)
 
 

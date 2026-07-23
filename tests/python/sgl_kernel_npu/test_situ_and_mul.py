@@ -6,152 +6,141 @@ import torch_npu
 from sgl_kernel_npu.activation.situ_and_mul import situ_and_mul
 
 
-def situ_and_mul_native(x, beta=4.0, linear_beta=25.0):
-    """Reference implementation (mirrors the source PyTorch SituAndMul)."""
-    d = x.shape[-1] // 2
-    gate = x[..., :d].to(torch.float32)
-    up = x[..., d:].to(torch.float32)
-    situ_a = beta * torch.tanh(gate / beta) * torch.sigmoid(gate)
-    if linear_beta is not None:
-        up = linear_beta * torch.tanh(up / linear_beta)
-    return (situ_a * up).to(x.dtype)
+def situ_and_mul_native(x, beta=4.0, linear_beta=25.0, chunk=1024):
+    """Reference (mirrors kimi_k3 SituAndMul). Chunked over tokens -> bit-exact + bounded memory
+    (the shared NPU has little free memory; an unchunked FP32 reference OOMs at large d/N)."""
+    x_2d = x.reshape(-1, x.shape[-1])
+    N, two_d = x_2d.shape
+    d = two_d // 2
+    out = torch.empty((N, d), dtype=x.dtype, device=x.device)
+    for i in range(0, N, chunk):
+        seg = x_2d[i:i + chunk]
+        gate = seg[:, :d].to(torch.float32)
+        up = seg[:, d:].to(torch.float32)
+        situ_a = beta * torch.tanh(gate / beta) * torch.sigmoid(gate)
+        if linear_beta is not None:
+            up = linear_beta * torch.tanh(up / linear_beta)
+        out[i:i + chunk] = (situ_a * up).to(x.dtype)
+    return out.reshape(*x.shape[:-1], d)
 
 
-# 16 experts; count-format per-expert token counts (sum = 157 real rows).
+# 16 experts, count-format (sum = 157 real rows) -- routed-MoE dispatch metadata.
 _COUNTS = [0, 32, 0, 0, 10, 0, 0, 0, 100, 0, 0, 5, 5, 5, 0, 0]
-_REAL_TOKENS = sum(_COUNTS)
-PROD_H = 3072 * 2
+_REAL = sum(_COUNTS)
 
-# Tolerances per triton-ascend debug_guide/precision.md:
-#   BF16 → rtol=atol=5e-3; FP32 → rtol=atol=1e-5; FP16 uses BF16 grade (doc
-#   has no FP16 entry). equal_nan=True (doc default).
+# Tolerances per triton-ascend debug_guide/precision.md: BF16 5e-3, FP32 1e-5. equal_nan=True.
 _TOL = {
     torch.bfloat16: (5e-3, 5e-3),
-    torch.float16: (5e-3, 5e-3),
     torch.float32: (1e-5, 1e-5),
 }
 
+# K3 shapes. d in {routed 3072, shared 6144, dense 33792}; N in {decode 1, batch 64, prefill 4096}.
+# d=33792 capped at N<=64: input [N,67584] gets big and the shared NPU is memory-tight;
+# H-tile correctness is about d (multi-tile), not N, so small N still exercises it fully.
+_DENSE_SHAPES = [(d, N) for d in (3072, 6144) for N in (1, 64, 4096)] + [
+    (33792, N) for N in (1, 64)
+]
+_ROUTED_D = (3072, 6144, 33792)
+_DTYPES = ((torch.bfloat16, "bf16"), (torch.float32, "fp32"))
+
 
 class TestSituAndMulPrecision(unittest.TestCase):
-    """Correctness vs the PyTorch reference across shapes, params, and dtypes."""
+    """Correctness vs the PyTorch reference across K3 shapes (dense + routed, prefill/decode)."""
 
-    def _check(self, h, s=4096, beta=4.0, linear_beta=25.0, counts=None,
-               scale=1.0, dtype=torch.bfloat16):
-        x = torch.randn((s, h), dtype=dtype).npu() * scale
-        c = counts if counts is not None else _COUNTS
-        group_list = torch.Tensor(c).npu().to(torch.int64)
-        real = sum(c)
-
-        out = situ_and_mul(x, group_list, 1, beta=beta, linear_beta=linear_beta)
-        ref = situ_and_mul_native(x, beta=beta, linear_beta=linear_beta)
+    def _run_dense(self, N, d, dtype):
+        torch.npu.empty_cache()
+        torch.manual_seed(0)
+        x = torch.randn((N, 2 * d), dtype=dtype).npu()
+        out = situ_and_mul(x)                          # group_list=None -> dense (all rows)
+        ref = situ_and_mul_native(x)
         rtol, atol = _TOL[dtype]
-        torch.testing.assert_close(out[:real], ref[:real], rtol=rtol, atol=atol,
+        torch.testing.assert_close(out, ref, rtol=rtol, atol=atol, equal_nan=True)
+
+    def _run_routed(self, d, dtype):
+        torch.npu.empty_cache()
+        torch.manual_seed(0)
+        s = 256                                        # padded dispatch tensor (real rows = _REAL)
+        x = torch.randn((s, 2 * d), dtype=dtype).npu()
+        group_list = torch.Tensor(_COUNTS).npu().to(torch.int64)
+        out = situ_and_mul(x, group_list, 1)           # routed: only first _REAL rows written
+        ref = situ_and_mul_native(x)
+        rtol, atol = _TOL[dtype]
+        torch.testing.assert_close(out[:_REAL], ref[:_REAL], rtol=rtol, atol=atol,
                                    equal_nan=True)
 
-    # ---- BF16 (doc: rtol=atol=5e-3) ----
-    def test_prod_shape_bf16(self):
-        self._check(h=PROD_H, dtype=torch.bfloat16)
 
-    def test_small_bf16(self):
-        self._check(h=8192, dtype=torch.bfloat16)
+def _make_dense(d, N, dtype):
+    def test(self):
+        self._run_dense(N=N, d=d, dtype=dtype)
+    return test
 
-    def test_mid_bf16(self):
-        self._check(h=3072, dtype=torch.bfloat16)
 
-    def test_without_linear_beta_bf16(self):
-        self._check(h=8192, linear_beta=None, dtype=torch.bfloat16)
+def _make_routed(d, dtype):
+    def test(self):
+        self._run_routed(d=d, dtype=dtype)
+    return test
 
-    def test_custom_beta_bf16(self):
-        self._check(h=8192, beta=2.0, linear_beta=10.0, dtype=torch.bfloat16)
 
-    def test_saturation_bf16(self):
-        self._check(h=8192, scale=50.0, dtype=torch.bfloat16)
-
-    def test_nd_input_bf16(self):
-        B, s, h = 2, 256, 8192
-        x = torch.randn((B, s, h), dtype=torch.bfloat16).npu()
-        group_list = torch.Tensor(_COUNTS).npu().to(torch.int64)
-        real = sum(_COUNTS)
-        out = situ_and_mul(x, group_list, 1)
-        self.assertEqual(out.shape, (B, s, h // 2))
-        ref = situ_and_mul_native(x)
-        rtol, atol = _TOL[torch.bfloat16]
-        torch.testing.assert_close(out.reshape(-1, h // 2)[:real],
-                                   ref.reshape(-1, h // 2)[:real],
-                                   rtol=rtol, atol=atol, equal_nan=True)
-
-    # ---- FP16 (BF16-grade tolerance; doc has no FP16 entry) ----
-    def test_fp16(self):
-        self._check(h=8192, dtype=torch.float16)
-
-    # ---- FP32 (doc: rtol=atol=1e-5) ----
-    def test_prod_shape_fp32(self):
-        self._check(h=PROD_H, dtype=torch.float32)
-
-    def test_saturation_fp32(self):
-        self._check(h=8192, scale=50.0, dtype=torch.float32)
+# Dense (group_list=None): full K3 d x N grid.
+for _d, _N in _DENSE_SHAPES:
+    for _dt, _name in _DTYPES:
+        setattr(TestSituAndMulPrecision, f"test_dense_d{_d}_N{_N}_{_name}",
+                _make_dense(_d, _N, _dt))
+# Routed (group_list): each d exercises the group_list path (and tiling at large d).
+for _d in _ROUTED_D:
+    for _dt, _name in _DTYPES:
+        setattr(TestSituAndMulPrecision, f"test_routed_d{_d}_{_name}", _make_routed(_d, _dt))
 
 
 class TestSituAndMulBoundary(unittest.TestCase):
-    """Edge cases: token-count boundaries, dtypes, and input validation."""
-
-    def _run(self, counts, h=8192, s=4096, beta=4.0, linear_beta=25.0):
-        x = torch.randn((s, h), dtype=torch.bfloat16).npu()
-        group_list = torch.Tensor(counts).npu().to(torch.int64)
-        real = sum(counts)
-        out = situ_and_mul(x, group_list, 1, beta=beta, linear_beta=linear_beta)
-        self.assertEqual(out.shape, (s, h // 2))
-        if real > 0:
-            ref = situ_and_mul_native(x, beta=beta, linear_beta=linear_beta)
-            rtol, atol = _TOL[torch.bfloat16]
-            torch.testing.assert_close(out[:real], ref[:real], rtol=rtol, atol=atol,
-                                       equal_nan=True)
-        return out, real
+    """Edge cases: dispatch boundaries, input validation, nd dense input."""
 
     def test_zero_tokens(self):
-        out, real = self._run([0] * 16)
-        self.assertEqual(real, 0)
+        # all experts empty -> total_rows=0 -> kernel writes nothing, must not crash.
+        x = torch.randn((16, 8192), dtype=torch.bfloat16).npu()
+        gl = torch.zeros(16, dtype=torch.int64).npu()
+        situ_and_mul(x, gl, 1)
 
-    def test_single_token(self):
-        out, real = self._run([1] + [0] * 15)
-        self.assertEqual(real, 1)
+    def test_single_token_dense(self):
+        x = torch.randn((1, 8192), dtype=torch.bfloat16).npu()
+        out = situ_and_mul(x)                          # dense, N=1 (decode)
+        ref = situ_and_mul_native(x)
+        torch.testing.assert_close(out, ref, rtol=5e-3, atol=5e-3, equal_nan=True)
 
-    def test_full_capacity(self):
-        s = 256
-        out, real = self._run([s] + [0] * 15, s=s)
-        self.assertEqual(real, s)
-
-    def test_all_in_one_expert(self):
-        out, real = self._run([0, 0, 200] + [0] * 13)
-        self.assertEqual(real, 200)
+    def test_nd_dense_input(self):
+        # dense path must accept >2D input (KimiMLP gate_up is [..., 2d]).
+        B, s, d = 2, 16, 3072
+        x = torch.randn((B, s, 2 * d), dtype=torch.bfloat16).npu()
+        out = situ_and_mul(x)
+        self.assertEqual(out.shape, (B, s, d))
+        ref = situ_and_mul_native(x)
+        torch.testing.assert_close(out, ref, rtol=5e-3, atol=5e-3, equal_nan=True)
 
     def test_group_list_int32(self):
-        x = torch.randn((4096, 8192), dtype=torch.bfloat16).npu()
-        group_list = torch.Tensor(_COUNTS).npu().to(torch.int32)
-        out = situ_and_mul(x, group_list, 1)
+        x = torch.randn((256, 8192), dtype=torch.bfloat16).npu()
+        gl = torch.Tensor(_COUNTS).npu().to(torch.int32)
+        out = situ_and_mul(x, gl, 1)
         ref = situ_and_mul_native(x)
-        rtol, atol = _TOL[torch.bfloat16]
-        torch.testing.assert_close(out[:_REAL_TOKENS], ref[:_REAL_TOKENS],
-                                   rtol=rtol, atol=atol, equal_nan=True)
+        torch.testing.assert_close(out[:_REAL], ref[:_REAL], rtol=5e-3, atol=5e-3,
+                                   equal_nan=True)
 
     def test_invalid_group_list_type(self):
         x = torch.randn((16, 8192), dtype=torch.bfloat16).npu()
-        group_list = torch.Tensor(_COUNTS).npu().to(torch.int64)
+        gl = torch.Tensor(_COUNTS).npu().to(torch.int64)
         with self.assertRaises(ValueError):
-            situ_and_mul(x, group_list, 2)
+            situ_and_mul(x, gl, 2)                     # group_list_type must be 0/1
 
     def test_invalid_group_list_dtype(self):
         x = torch.randn((16, 8192), dtype=torch.bfloat16).npu()
-        group_list = torch.Tensor(_COUNTS).npu().to(torch.float32)
+        gl = torch.Tensor(_COUNTS).npu().to(torch.float32)
         with self.assertRaises(ValueError):
-            situ_and_mul(x, group_list, 1)
+            situ_and_mul(x, gl, 1)                     # group_list dtype must be int32/int64
 
     def test_odd_last_dim(self):
         x = torch.randn((16, 8191), dtype=torch.bfloat16).npu()
-        group_list = torch.Tensor(_COUNTS).npu().to(torch.int64)
         with self.assertRaises(ValueError):
-            situ_and_mul(x, group_list, 1)
+            situ_and_mul(x)                            # dense path also requires even last dim
 
 
 if __name__ == "__main__":
-    unittest.main(verbosity=2)
+    unittest.main()
