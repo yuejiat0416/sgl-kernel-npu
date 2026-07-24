@@ -85,7 +85,7 @@ def _situ_and_mul_quant_kernel(
 
 
 @triton.autotune(
-    configs=[triton.Config({"BLOCK_H": b, "multibuffer": True}) for b in (1024, 2048, 4096, 8192)],
+    configs=[triton.Config({"BLOCK_H": b, "multibuffer": True}) for b in (4096, 8192, 16384)],
     key=["HALF_COLS", "HAS_GROUP_LIST"],
 )
 @triton.jit
@@ -219,7 +219,7 @@ def situ_and_mul_quant(
     if do_quant:
         _situ_and_mul_quant_kernel[(num_vectorcore,)](
             x_2d, group_list_arg, out, scale,
-            TOTAL_COLS=h, HALF_COLS=half_cols, COL_BLOCK_SIZE=1536,
+            TOTAL_COLS=h, HALF_COLS=half_cols, COL_BLOCK_SIZE=half_cols,
             NUM_EXPERTS=num_experts_arg, NUM_EXPERTS_ALGIN=num_experts_algin_arg,
             GROUP_LIST_TYPE=gl_type_arg, N_ROWS=s, NUM_CORES=num_vectorcore,
             HAS_GROUP_LIST=has_group_list, BETA=beta, INV_BETA=1.0 / beta,
