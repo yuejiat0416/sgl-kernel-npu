@@ -8,12 +8,9 @@ import triton.language.extra.cann.extension as al
 
 from sgl_kernel_npu.utils.triton_utils import get_device_properties
 
-# quant supports d in {3072, 6144} (full-row load, fits UB); d=33792 falls back to the
-# unquant kernel below (no quantization). See situ_and_mul_quant() dispatch.
-
 
 @triton.jit
-def _situ_and_mul_quant_kernel(
+def _situ_and_mul_quant_moe_kernel(
     x_ptr,
     group_list_ptr,
     out_ptr,
@@ -35,11 +32,11 @@ def _situ_and_mul_quant_kernel(
     SCALE: tl.constexpr,
     DTYPE_MAX: tl.constexpr,
 ):
-    # total_rows: from group_list (routed MoE) or N_ROWS (dense / shared).
+    # full-row load (d<=6144 fits UB). SCALE=True -> int8 quant, SCALE=False -> BF16 situ.
     if HAS_GROUP_LIST:
-        if GROUP_LIST_TYPE == 0:  # cusum
+        if GROUP_LIST_TYPE == 0:
             total_rows = tl.load(group_list_ptr + NUM_EXPERTS).to(tl.int32)
-        else:  # count
+        else:
             gl_offsets = tl.arange(0, NUM_EXPERTS_ALGIN)
             gl_mask = gl_offsets < NUM_EXPERTS
             group_list = tl.load(group_list_ptr + gl_offsets, gl_mask, other=0).to(tl.int32)
@@ -54,7 +51,6 @@ def _situ_and_mul_quant_kernel(
         return
     row_end = tl.minimum((pid + 1) * block_size, total_rows)
 
-    # full-row load (d<=6144 fits UB): situ computed once, single tl.max over the row.
     cols = tl.arange(0, HALF_COLS)
     for row_idx in range(row_begin, row_end):
         row_off = row_idx.to(tl.int64) * TOTAL_COLS
@@ -68,7 +64,6 @@ def _situ_and_mul_quant_kernel(
         if SCALE:
             scale = tl.maximum(tl.max(tl.abs(out)) / DTYPE_MAX, 1e-30)
             tl.store(scale_ptr + row_idx.to(tl.int64), scale.to(scale_ptr.dtype.element_ty))
-            # quantize in COL_BLOCK_SIZE slices (a full-row rint overflows UB, cf. swiglu_quant).
             for cb in range(0, HALF_COLS, COL_BLOCK_SIZE):
                 tmp = al.extract_slice(out, offsets=(cb,), sizes=(COL_BLOCK_SIZE,), strides=(1,))
                 tmp = tmp.to(tl.float32) / scale
@@ -83,12 +78,8 @@ def _situ_and_mul_quant_kernel(
                      out.to(out_ptr.dtype.element_ty))
 
 
-@triton.autotune(
-    configs=[triton.Config({"BLOCK_H": b, "multibuffer": True}) for b in (4096, 8192, 16384)],
-    key=["HALF_COLS", "HAS_GROUP_LIST"],
-)
 @triton.jit
-def _situ_and_mul_kernel(
+def _situ_and_mul_dense_kernel(
     x_ptr,
     group_list_ptr,
     out_ptr,
@@ -107,7 +98,7 @@ def _situ_and_mul_kernel(
     INV_LINEAR_BETA: tl.constexpr,
     BLOCK_H: tl.constexpr,
 ):
-    # unquant situ (H-tiled), same as situ_and_mul.py -- used for d=33792 (no quant).
+    # H-tiled unquant situ for d=33792 (no quant; dense-quant to be implemented).
     if HAS_GROUP_LIST:
         if GROUP_LIST_TYPE == 0:
             total_rows = tl.load(group_list_ptr + NUM_EXPERTS).to(tl.int32)
@@ -151,7 +142,12 @@ def situ_and_mul_quant(
     need_quant: bool = True,
     quant_type: int = 0,
 ):
-    """SituAndMul activation + fused dynamic int8 quant (d<=6144); unquant fallback (d=33792).
+    """
+    Dispatch by d: 
+        1. d<=6144 (MoE/shared) -> _situ_and_mul_quant_moe_kernel (SCALE=need_quant:
+            int8 quant if True, BF16 situ if False). 
+        2. d>6144 (dense layer0) -> _situ_and_mul_dense_kernel
+            (H-tiled, situ only, no quant yet).
 
     Args:
         x: ``[..., 2d]`` tensor (gate | up halves along the last dim).
@@ -159,23 +155,24 @@ def situ_and_mul_quant(
             ``None`` = dense / shared path (all rows). Required for routed MoE.
         group_list_type: 0 = cusum, 1 = count. Ignored when ``group_list is None``.
         beta / linear_beta: SituAndMul soft-saturation bounds (``linear_beta=None`` leaves up).
-        need_quant: True -> int8 out + per-token fp32 scale; False -> activation out (scale is
-            uninitialised, caller must ignore).
+        need_quant: True -> int8 out + per-token fp32 scale (d<=6144 only); False -> activation
+            out (scale is uninitialised, caller must ignore).
         quant_type: 0 = int8 (default), 1 = fp8 (deferred -> NotImplementedError).
 
     Returns:
-        ``(out, scale)``. For d<=6144 + quant: ``out`` int8, ``scale`` fp32. For d>6144 (e.g.
-        33792) or need_quant=False: ``out`` is the BF16/FP32 activation (no quant), ``scale``
-        uninitialised -- quant only supports d in {3072, 6144}.
+        ``(out, scale)``. For d<=6144 + need_quant: ``out`` int8, ``scale`` fp32. Otherwise
+        ``out`` is the BF16/FP32 activation, ``scale`` uninitialised.
     """
     if quant_type not in (0, 1):
         raise ValueError(f"quant_type must be 0 (int8) or 1 (fp8), but got {quant_type}")
+    
+    # TODO: a5 fp8 (quant_type=1) to be implemented.
     if need_quant and quant_type == 1:
         raise NotImplementedError(
             "fp8 (quant_type=1) is deferred: A5-only, uses npu_dynamic_mx_quant (not fusible "
             "into Triton); MoE MXFP8 downstream still WIP in sglang. Use quant_type=0 (int8)."
         )
-
+    
     has_group_list = group_list is not None
     if has_group_list and group_list_type not in (0, 1):
         raise ValueError(f"group_list_type must be 0 or 1, but got {group_list_type}")
@@ -185,11 +182,10 @@ def situ_and_mul_quant(
     x_2d = x.reshape(-1, x.shape[-1])
     s, h = x_2d.shape
     half_cols = h // 2
-    # quant only for small d (3072/6144); large d (33792) -> unquant fallback.
-    do_quant = need_quant and (half_cols <= 6144)
-    out_dtype = torch.int8 if do_quant else x.dtype
-    out = torch.empty((s, half_cols), dtype=out_dtype, device=x.device)
-    scale = torch.empty((s,), dtype=torch.float32, device=x.device)
+    if need_quant and half_cols > 6144:
+        raise NotImplementedError(
+            "quantization not yet supported for d>6144 (dense MLP); set need_quant=False. "
+        )
 
     if has_group_list:
         num_experts = group_list.shape[0]
@@ -213,10 +209,13 @@ def situ_and_mul_quant(
 
     do_linear_beta = linear_beta is not None
     linear_beta_v = linear_beta if do_linear_beta else 1.0
-
     _, num_vectorcore = get_device_properties()
-    if do_quant:
-        _situ_and_mul_quant_kernel[(num_vectorcore,)](
+
+    if half_cols <= 6144:  # MoE/shared -> moe kernel (SCALE=need_quant)
+        out_dtype = torch.int8 if need_quant else x.dtype
+        out = torch.empty((s, half_cols), dtype=out_dtype, device=x.device)
+        scale = torch.empty((s,), dtype=torch.float32, device=x.device)
+        _situ_and_mul_quant_moe_kernel[(num_vectorcore,)](
             x_2d, group_list_arg, out, scale,
             TOTAL_COLS=h, HALF_COLS=half_cols, COL_BLOCK_SIZE=half_cols,
             NUM_EXPERTS=num_experts_arg, NUM_EXPERTS_ALGIN=num_experts_algin_arg,
@@ -226,8 +225,10 @@ def situ_and_mul_quant(
             INV_LINEAR_BETA=(1.0 / linear_beta_v) if do_linear_beta else 1.0,
             SCALE=need_quant, DTYPE_MAX=127, multibuffer=True,
         )
-    else:
-        _situ_and_mul_kernel[(num_vectorcore,)](
+    else:  # dense (33792) -> dense kernel (situ only; need_quant is False here)
+        out = torch.empty((s, half_cols), dtype=x.dtype, device=x.device)
+        scale = torch.empty((s,), dtype=torch.float32, device=x.device)
+        _situ_and_mul_dense_kernel[(num_vectorcore,)](
             x_2d, group_list_arg, out,
             TOTAL_COLS=h, HALF_COLS=half_cols,
             NUM_EXPERTS=num_experts_arg, NUM_EXPERTS_ALGIN=num_experts_algin_arg,
@@ -235,5 +236,6 @@ def situ_and_mul_quant(
             HAS_GROUP_LIST=has_group_list, BETA=beta, INV_BETA=1.0 / beta,
             DO_LINEAR_BETA=do_linear_beta, LINEAR_BETA=linear_beta_v,
             INV_LINEAR_BETA=(1.0 / linear_beta_v) if do_linear_beta else 1.0,
+            BLOCK_H=8192, multibuffer=True,
         )
     return out.reshape(*x.shape[:-1], half_cols), scale
