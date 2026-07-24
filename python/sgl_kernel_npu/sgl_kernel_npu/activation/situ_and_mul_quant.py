@@ -3,7 +3,6 @@ from typing import Optional
 import torch
 import triton
 import triton.language as tl
-import triton.backends.ascend.runtime  # REQUIRED: activates the Triton-Ascend autotune path
 import triton.language.extra.cann.libdevice as libdevice
 import triton.language.extra.cann.extension as al
 
