@@ -143,7 +143,7 @@ def main(argv=None):
                 "candidate_module": candidate.__file__,
                 "candidate_host_module": candidate.split_qkv_rmsnorm_rope.__module__,
                 "device_properties_helper": inspect.getsourcefile(
-                    candidate.get_device_properties
+                    inspect.unwrap(candidate.get_device_properties)
                 ),
                 "installed_source_sha256": hashlib.sha256(installed_source).hexdigest(),
                 "candidate_source_sha256": hashlib.sha256(candidate_source).hexdigest(),

@@ -9,6 +9,7 @@ import sys
 import tempfile
 import unittest
 from dataclasses import dataclass
+from functools import cache
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
 from unittest import mock
@@ -174,6 +175,77 @@ class HostDispatchTests(unittest.TestCase):
 
 
 class RunnerTests(unittest.TestCase):
+    def test_cached_helper_metadata_allows_runner_to_reach_pytest(self):
+        @cache
+        def cached_properties():
+            raise AssertionError("Source inspection must not execute the helper")
+
+        # Exercise main's actual metadata path with the same wrapper type as the
+        # image. The fake runtime does not perform or validate NPU computation.
+        candidate = SimpleNamespace(
+            __file__=str(ROOT / SOURCE),
+            get_device_properties=cached_properties,
+            split_qkv_rmsnorm_rope=SimpleNamespace(__module__=runner.MODULE),
+        )
+        installed = SimpleNamespace(__file__=str(ROOT / SOURCE))
+        restore = mock.Mock()
+        fake_npu = SimpleNamespace(
+            is_available=lambda: True,
+            device_count=lambda: 1,
+            set_device=mock.Mock(),
+            get_device_properties=lambda device: "test device",
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / "evidence"
+
+            def run_pytest(arguments, plugins):
+                self.assertTrue(any(arg.startswith("--junitxml=") for arg in arguments))
+                plugins[0].pytest_collection_finish(
+                    SimpleNamespace(
+                        items=[
+                            SimpleNamespace(path=ROOT / name) for name in runner.TESTS
+                        ]
+                    )
+                )
+                (output / "pytest.xml").write_text(
+                    "<testsuites><testsuite><testcase/></testsuite></testsuites>"
+                )
+                return 0
+
+            pytest_main = mock.Mock(side_effect=run_pytest)
+            with (
+                mock.patch.dict(
+                    sys.modules,
+                    {
+                        "torch": SimpleNamespace(npu=fake_npu),
+                        "torch_npu": ModuleType("torch_npu"),
+                        "pytest": SimpleNamespace(main=pytest_main),
+                    },
+                ),
+                mock.patch.object(
+                    runner,
+                    "load_candidate",
+                    return_value=(installed, candidate, restore),
+                ),
+                mock.patch.object(
+                    runner.importlib, "import_module", return_value=installed
+                ),
+                mock.patch.object(
+                    runner.importlib.metadata, "version", return_value="test"
+                ),
+            ):
+                code = runner.main(["--out", str(output)])
+            report = json.loads((output / "report.json").read_text())
+            self.assertEqual(code, 0)
+            self.assertEqual(report["status"], "PUBLIC_HOST_TESTS_PASS")
+            self.assertEqual(
+                Path(report["device_properties_helper"]).resolve(),
+                Path(__file__).resolve(),
+            )
+            self.assertEqual(cached_properties.cache_info().currsize, 0)
+            pytest_main.assert_called_once()
+            restore.assert_called_once()
+
     def test_filtered_or_missing_test_files_cannot_pass_selection_audit(self):
         files = [ROOT / name for name in runner.TESTS]
         audit = runner.SelectionAudit(files)
