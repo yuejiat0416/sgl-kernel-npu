@@ -32,11 +32,19 @@ directory supplied with `--out`. Inspect:
 - `installed_module.py` and `candidate_module.py`: the exact compared sources.
 - `traceback.txt`: runner setup errors, if any.
 
-The current suite includes the four existing cases and 67 new cases. New cases
-exercise public-host 192 execution, BF16/FP32 position caches, changed-input graph
-replay, old dimensions, and unsupported 192 inputs. A pass does not establish
-model accuracy, distributed operation, or performance. No performance threshold
-is introduced by this runner.
+The current suite includes the four existing cases and 43 additional cases.
+These exercise public-host 192 execution, BF16/FP32 position caches,
+changed-input graph replay, old dimensions, and representative existing operator
+options with 192 heads: GQA, optional normalization, bias, partial and interleaved
+RoPE, floating-point dtypes, and equivalent contiguous views.
+
+The 192 path follows the existing operator's input contract. The earlier
+192-only dtype/norm/RoPE restrictions and their rejection tests have been removed.
+Callers still need to supply valid buffer sizes, layouts, and optional parameter
+combinations, as they do for existing dimensions. This suite does not pass
+malformed buffers or invalid device pointers to the kernel to test for rejection.
+A pass does not establish model accuracy, distributed operation, or performance.
+No performance threshold is introduced by this runner.
 
 CPU-only checks for dispatch compatibility and the temporary module loader:
 

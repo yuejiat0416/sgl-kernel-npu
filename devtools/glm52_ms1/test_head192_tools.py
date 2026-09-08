@@ -173,6 +173,53 @@ class HostDispatchTests(unittest.TestCase):
 
         self.assertEqual(functions(self.before), functions(self.after))
 
+    def test_192_preserves_existing_parameter_modes(self):
+        for options in (
+            {"ratio": 2},
+            {"ratio": 3, "bias": True},
+            {"norm": False},
+            {"partial": True},
+            {"neox": False},
+            {"dtype": "fp16"},
+            {"dtype": "fp32", "norm": False, "neox": False},
+        ):
+            with self.subTest(options=options):
+                args, kwargs = inputs(192, **options)
+                host, call = host_from_source(self.after)
+                outputs = host(*args, **kwargs)
+                self.assertEqual(
+                    [o.shape for o in outputs],
+                    [(11, args[3]), (11, args[4]), (11, args[4])],
+                )
+                self.assertEqual([o.dtype for o in outputs], [args[0].dtype] * 3)
+                self.assertEqual(call.grid, (10, 4, 1))
+                self.assertEqual(
+                    call.args[6:10],
+                    (
+                        kwargs["q_weight"],
+                        kwargs["q_bias"],
+                        kwargs["k_weight"],
+                        kwargs["k_bias"],
+                    ),
+                )
+                self.assertEqual(
+                    call.args[14:19],
+                    (
+                        kwargs["eps"],
+                        options.get("ratio", 1) * 192,
+                        192,
+                        kwargs["q_bias"] is not None,
+                        kwargs["eps"] is not None,
+                    ),
+                )
+                self.assertEqual(
+                    call.kwargs,
+                    {
+                        "DO_PARTIAL": options.get("partial", False),
+                        "DO_HALF": kwargs["is_neox_style"],
+                    },
+                )
+
 
 class RunnerTests(unittest.TestCase):
     def test_cached_helper_metadata_allows_runner_to_reach_pytest(self):
