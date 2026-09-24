@@ -2,6 +2,7 @@
 
 import ast
 import importlib.util
+import itertools
 import json
 import math
 import subprocess
@@ -139,14 +140,20 @@ class HostDispatchTests(unittest.TestCase):
                     self.assertEqual(old_launch.args, new_launch.args)
                     self.assertEqual(old_launch.kwargs, new_launch.kwargs)
 
-    def test_other_non_power_of_two_dimensions_still_rejected(self):
+    def test_other_non_power_of_two_dimensions_use_complete_heads(self):
         for dim in (96, 160, 384):
-            for source in (self.before, self.after):
-                with self.subTest(dim=dim, baseline=source is self.before):
-                    host, _ = host_from_source(source)
-                    args, kwargs = inputs(dim)
-                    with self.assertRaises(AssertionError):
-                        host(*args, **kwargs)
+            with self.subTest(dim=dim):
+                args, kwargs = inputs(dim)
+                old, _ = host_from_source(self.before)
+                with self.assertRaises(AssertionError):
+                    old(*args, **kwargs)
+                new, call = host_from_source(self.after)
+                outputs = new(*args, **kwargs)
+                self.assertEqual(call.grid, (10, 4, 1))
+                self.assertEqual(call.args[15:17], (dim, dim))
+                self.assertEqual(call.args[19:23], (dim, dim, dim // 2, 0))
+                self.assertEqual(call.kwargs, {"DO_PARTIAL": False, "DO_HALF": True})
+                self.assertEqual([o.shape for o in outputs], [(11, 4 * dim)] * 3)
 
     def test_192_uses_complete_heads_without_compiler_override(self):
         for heads in (1, 2, 3, 4, 8, 16, 32, 64):
@@ -221,7 +228,251 @@ class HostDispatchTests(unittest.TestCase):
                 )
 
 
+class NativeReferenceTests(unittest.TestCase):
+    def test_native_math_on_cpu_matches_existing_fp32_oracle(self):
+        """Real Torch math only: this does not emulate or validate NPU execution."""
+        try:
+            import pytest  # noqa: F401
+            import torch
+        except ImportError:
+            self.skipTest("CPU mathematical check requires Torch and pytest")
+        path = ROOT / runner.TESTS[1]
+        spec = importlib.util.spec_from_file_location("head192_cpu_oracle", path)
+        oracle = importlib.util.module_from_spec(spec)
+        # Import existing case construction without importing any NPU binary.
+        kernel = ModuleType(runner.MODULE)
+        kernel.split_qkv_rmsnorm_rope = None
+        utilities = ModuleType("sgl_kernel_npu.utils.triton_utils")
+        utilities.get_device_properties = mock.Mock(
+            side_effect=AssertionError("CPU math must not invent NPU core counts")
+        )
+        with mock.patch.dict(
+            sys.modules,
+            {
+                "torch_npu": ModuleType("torch_npu"),
+                runner.MODULE: kernel,
+                "sgl_kernel_npu.utils.triton_utils": utilities,
+            },
+        ):
+            spec.loader.exec_module(oracle)
+
+        checked = 0
+
+        def native_on_cpu(**case):
+            nonlocal checked
+            expected = oracle._reference(case)
+            fp32 = runner.torch_reference(torch, case, cast_output=False)
+            for actual, wanted in zip(fp32[:2], expected[:2]):
+                torch.testing.assert_close(actual, wanted, rtol=0, atol=0)
+            output = runner.torch_reference(torch, case)
+            runner.check_outputs(torch, output, expected, case["input"].dtype)
+            if output[2].numel():
+                self.assertNotEqual(
+                    output[2].untyped_storage().data_ptr(),
+                    case["input"].untyped_storage().data_ptr(),
+                )
+            checked += 1
+            return output
+
+        # Preserve all source-defined shapes, seeds, dtypes, caches and options.
+        oracle.split_qkv_rmsnorm_rope = native_on_cpu
+        oracle._to_device = lambda case: case
+        functions = (
+            oracle.test_public_host_shapes,
+            oracle.test_head192_public_host_2d_cache,
+            oracle.test_head192_public_host_norm_boundaries,
+            oracle.test_existing_head_dimensions_public_host,
+            oracle.test_head192_public_host_existing_modes,
+        )
+        with mock.patch.object(
+            torch, "npu", SimpleNamespace(synchronize=lambda: None), create=True
+        ):
+            for function in functions:
+                axes = []
+                for mark in function.pytestmark:
+                    if mark.name != "parametrize":
+                        continue
+                    names, values = mark.args[:2]
+                    names = [name.strip() for name in names.split(",")]
+                    axes.append(
+                        [
+                            dict(
+                                zip(
+                                    names,
+                                    (
+                                        value.values
+                                        if hasattr(value, "values")
+                                        else (value,) if len(names) == 1 else value
+                                    ),
+                                )
+                            )
+                            for value in values
+                        ]
+                    )
+                for combination in itertools.product(*axes):
+                    parameters = {
+                        key: value
+                        for axis in combination
+                        for key, value in axis.items()
+                    }
+                    with self.subTest(
+                        function=function.__name__, parameters=parameters
+                    ):
+                        function(**parameters)
+        self.assertGreater(checked, 0)
+        utilities.get_device_properties.assert_not_called()
+
+
 class RunnerTests(unittest.TestCase):
+    def test_benchmark_capture_preserves_exact_inputs_and_defaults(self):
+        def candidate(input, head_dim, eps=None, is_neox_style=True):
+            return input
+
+        audit = runner.BenchmarkAudit(None, candidate, None)
+        first, last = object(), object()
+        wrapped = audit.wrap()
+        self.assertIs(wrapped(first, 128), first)
+        self.assertIs(wrapped(last, 192, eps=1e-5, is_neox_style=False), last)
+        self.assertEqual(audit.calls, 2)
+        self.assertIs(audit.last_case["input"], last)
+        self.assertEqual(audit.last_case["head_dim"], 192)
+        self.assertEqual(audit.last_case["eps"], 1e-5)
+        self.assertFalse(audit.last_case["is_neox_style"])
+        audit.pytest_runtest_setup(None)
+        self.assertIsNone(audit.last_case)
+        self.assertEqual(audit.calls, 0)
+        wrapped(first, 64)
+        self.assertIsNone(audit.last_case["eps"])
+        self.assertTrue(audit.last_case["is_neox_style"])
+
+    def test_benchmark_timer_excludes_warmup_and_reports_each_round(self):
+        call, synchronize = mock.Mock(), mock.Mock()
+        with mock.patch.object(
+            runner.time, "perf_counter", side_effect=[0, 0.003, 1, 1.006]
+        ):
+            result = runner.measure_calls(
+                call, synchronize, warmup=10, rounds=2, calls=30
+            )
+        self.assertEqual(call.call_count, 70)
+        self.assertEqual(synchronize.call_count, 4)
+        self.assertAlmostEqual(result["round_us_per_call"][0], 100)
+        self.assertAlmostEqual(result["round_us_per_call"][1], 200)
+        self.assertAlmostEqual(result["median_us_per_call"], 150)
+        self.assertEqual((runner.WARMUP, runner.ROUNDS, runner.CALLS), (10, 5, 30))
+
+    def test_benchmark_baseline_support_is_not_a_shape_substitution(self):
+        for dim in (64, 128, 192, 256):
+            self.assertTrue(runner.baseline_supports(dim))
+        for dim in (0, 96, 160, 384):
+            self.assertFalse(runner.baseline_supports(dim))
+
+    def test_benchmark_records_native_ratios_and_unsupported_baseline(self):
+        candidate, baseline = mock.Mock(), mock.Mock()
+        # Signature is needed only for the recorder; no operator is executed.
+        audit = runner.BenchmarkAudit(
+            SimpleNamespace(Tensor=Tensor), candidate, baseline
+        )
+
+        def measured(torch, function, case, expected):
+            self.assertEqual(case, {"head_dim": 96})
+            median = 2 if function is candidate else 10
+            return {
+                mode: {"status": "MEASURED", "median_us_per_call": median}
+                for mode in ("eager", "graph")
+            }
+
+        row = {}
+        with (
+            mock.patch.object(runner, "torch_reference", return_value="truth"),
+            mock.patch.object(
+                runner, "benchmark_implementation", side_effect=measured
+            ) as run,
+        ):
+            audit.run_case(row, {"head_dim": 96})
+        self.assertEqual(row["status"], "MEASURED")
+        self.assertEqual(row["implementations"]["pr_baseline"]["status"], "UNSUPPORTED")
+        self.assertEqual(row["ratios"]["graph"]["torch_over_candidate"], 5)
+        self.assertNotIn("candidate_over_baseline", row["ratios"]["eager"])
+        self.assertEqual(run.call_count, 2)
+        baseline.assert_not_called()
+
+    def test_benchmark_failure_cannot_be_reported_complete(self):
+        audit = runner.BenchmarkAudit(
+            SimpleNamespace(Tensor=Tensor), mock.Mock(), mock.Mock()
+        )
+        results = {
+            "eager": {"status": "MEASURED", "median_us_per_call": 1},
+            "graph": {"status": "FAILED", "error": "capture failed"},
+        }
+        row = {}
+        with (
+            mock.patch.object(runner, "torch_reference", return_value="truth"),
+            mock.patch.object(runner, "benchmark_implementation", return_value=results),
+        ):
+            audit.run_case(row, {"head_dim": 192})
+        audit.results.append(row)
+        self.assertEqual(row["status"], "FAILED")
+        self.assertFalse(audit.complete)
+
+    def test_benchmark_only_excludes_the_separate_gemma_operator(self):
+        audit = runner.BenchmarkAudit(None, mock.Mock(), None)
+        audit.pytest_runtest_logreport(
+            SimpleNamespace(
+                when="call",
+                passed=True,
+                nodeid="file.py::test_split_qkvgate_gemma_rmsnorm_rope",
+            )
+        )
+        self.assertEqual(audit.results[0]["status"], "NOT_APPLICABLE")
+        self.assertFalse(audit.complete)
+        audit.pytest_runtest_logreport(
+            SimpleNamespace(
+                when="call", passed=True, nodeid="file.py::test_missing_operator"
+            )
+        )
+        self.assertEqual(audit.results[1]["status"], "FAILED")
+
+    def test_missing_benchmark_baseline_fails_before_import(self):
+        with tempfile.TemporaryDirectory() as directory:
+            with mock.patch.object(
+                runner.subprocess,
+                "run",
+                return_value=SimpleNamespace(returncode=128, stderr=b"missing object"),
+            ):
+                with self.assertRaisesRegex(RuntimeError, "fetch that commit first"):
+                    runner.load_baseline(ROOT, Path(directory))
+            self.assertEqual(list(Path(directory).iterdir()), [])
+
+    def test_changed_baseline_blob_cannot_be_used_for_comparison(self):
+        with tempfile.TemporaryDirectory() as directory:
+            with mock.patch.object(
+                runner.subprocess,
+                "run",
+                return_value=SimpleNamespace(returncode=0, stdout=b"unverified source"),
+            ):
+                with self.assertRaisesRegex(
+                    RuntimeError, "differs from the verified PR blob"
+                ):
+                    runner.load_baseline(ROOT, Path(directory))
+            self.assertEqual(list(Path(directory).iterdir()), [])
+
+    def test_accuracy_failure_prevents_timing_and_graph_measurement(self):
+        runtime = SimpleNamespace(npu=SimpleNamespace(synchronize=mock.Mock()))
+        function = mock.Mock(return_value="wrong output")
+        with (
+            mock.patch.object(
+                runner, "check_outputs", side_effect=AssertionError("wrong values")
+            ),
+            mock.patch.object(runner, "measure_calls") as timer,
+        ):
+            result = runner.benchmark_implementation(
+                runtime, function, {"input": SimpleNamespace(dtype="bf16")}, "truth"
+            )
+        self.assertEqual(result["eager"]["status"], "FAILED")
+        self.assertIn("wrong values", result["eager"]["error"])
+        self.assertEqual(result["graph"]["status"], "NOT_RUN")
+        timer.assert_not_called()
+
     def test_cached_helper_metadata_allows_runner_to_reach_pytest(self):
         @cache
         def cached_properties():
