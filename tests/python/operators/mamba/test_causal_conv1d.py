@@ -311,7 +311,8 @@ def clone_test_data(data, device=None):
 def valid_rows(data):
     """Only pad y is undefined; the entire state pool is always compared."""
     x = data["x"]
-    mask = torch.zeros(x.numel() // x.shape[-1], dtype=torch.bool)
+    # check_result indexes CPU outputs; pytest sets the default device to NPU.
+    mask = torch.zeros(x.numel() // x.shape[-1], dtype=torch.bool, device="cpu")
     query = data["query_start_loc"].cpu()
     for seq, slot in enumerate(data["cache_indices"].cpu().tolist()):
         if slot != data["pad_slot_id"]:
