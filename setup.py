@@ -40,7 +40,7 @@ def arguments(argv=None):
         "--third-party-workers",
         type=int,
         default=1,
-        help="concurrent third-party build groups sharing the --jobs budget",
+        help="concurrent third-party build groups, each using --jobs",
     )
     parser.add_argument(
         "--codegen-jobs",
@@ -121,7 +121,6 @@ def main(argv=None):
             args.arch_version,
             args.jobs,
             third_party=args.third_party,
-            workers=args.third_party_workers,
         )
     if args.plan:
         import json
@@ -129,7 +128,7 @@ def main(argv=None):
         print(json.dumps(plan, indent=2))
         return
     dependencies = (
-        build_dependencies(plan, workers=min(args.third_party_workers, args.jobs))
+        build_dependencies(plan, workers=args.third_party_workers)
         if plan
         else []
     )

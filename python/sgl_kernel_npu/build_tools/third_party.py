@@ -67,7 +67,7 @@ def resolve_soc_version(arch_version):
 
 
 def resolve_plan(
-    version, arch, jobs=None, source_root=PROJECT_ROOT, *, third_party=None, workers=1
+    version, arch, jobs=None, source_root=PROJECT_ROOT, *, third_party=None
 ):
     if not re.fullmatch(r"\d+\.\d+\.\d+", version):
         raise ValueError("Expected an exact CANN version, e.g. 9.2.0")
@@ -106,7 +106,7 @@ def resolve_plan(
         additional = config.pop("additional_builds", [])
         builds.append((config_path, config))
         builds.extend((config_path, dict(config, **build)) for build in additional)
-    selected = []
+    plan = []
     for config_path, config in builds:
         if not isinstance(config.get("has_aicpu", False), bool):
             raise ValueError("has_aicpu must be a boolean")
@@ -130,13 +130,7 @@ def resolve_plan(
             continue
         builder = config.get("builder", config_path.stem)
         config["arch_version"] = str(arch)
-        selected.append((builder, config))
-    group_jobs = jobs
-    if workers > 1 and jobs is not None and selected:
-        group_jobs = jobs // min(workers, len(selected), jobs)
-    plan = []
-    for builder, config in selected:
-        config = get_adapter(builder).configure(config, group_jobs)
+        config = get_adapter(builder).configure(config, jobs)
         plan.append(
             dict(config, builder=builder, cann_version=version, arch_version=str(arch))
         )
