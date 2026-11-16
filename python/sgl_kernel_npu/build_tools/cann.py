@@ -123,6 +123,7 @@ def build_cann(
     native_operators=("ALL",),
     *,
     jobs=None,
+    codegen_jobs=None,
     source_root=PROJECT_ROOT,
     build_root=None,
 ):
@@ -130,6 +131,8 @@ def build_cann(
     compute_units = architecture(arch_version, source_root)["compute_units"]
     if jobs is not None and jobs < 1:
         raise ValueError("--jobs must be positive")
+    if codegen_jobs is not None and codegen_jobs < 1:
+        raise ValueError("--codegen-jobs must be positive")
     source_root = Path(source_root).resolve()
     build_root = Path(build_root) if build_root is not None else source_root / "build"
     if build_root.is_symlink():
@@ -170,6 +173,7 @@ def build_cann(
         # HOST compilation must discover Torch in this build Python environment.
         "-DPython3_EXECUTABLE=" + sys.executable,
         "-DSGL_CANN_BUILD_STAGE=KERNEL",
+        "-DSGL_CANN_CODEGEN_JOBS=" + (str(codegen_jobs) if codegen_jobs else ""),
     ]
     run(command, directory / "configure.log", cwd=source_root, env=env)
     cann_operators = _selection(directory)

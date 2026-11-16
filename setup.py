@@ -36,6 +36,17 @@ def arguments(argv=None):
     parser.add_argument(
         "-j", "--jobs", type=int, default=16, help="parallel compilation jobs"
     )
+    parser.add_argument(
+        "--third-party-workers",
+        type=int,
+        default=1,
+        help="concurrent third-party build groups sharing the --jobs budget",
+    )
+    parser.add_argument(
+        "--codegen-jobs",
+        type=int,
+        help="jobs for CANN npu_op_code_gen (default: SDK policy)",
+    )
     third_party = parser.add_mutually_exclusive_group()
     third_party.add_argument(
         "--third-party",
@@ -67,6 +78,10 @@ def arguments(argv=None):
         parser.error("--arch-version is required")
     if args.jobs < 1:
         parser.error("--jobs must be positive")
+    if args.third_party_workers < 1:
+        parser.error("--third-party-workers must be positive")
+    if args.codegen_jobs is not None and args.codegen_jobs < 1:
+        parser.error("--codegen-jobs must be positive")
     if args.third_party is not None:
         if args.artifact != "wheel":
             parser.error("--third-party requires --artifact wheel")
@@ -106,13 +121,18 @@ def main(argv=None):
             args.arch_version,
             args.jobs,
             third_party=args.third_party,
+            workers=args.third_party_workers,
         )
     if args.plan:
         import json
 
         print(json.dumps(plan, indent=2))
         return
-    dependencies = build_dependencies(plan) if plan else []
+    dependencies = (
+        build_dependencies(plan, workers=min(args.third_party_workers, args.jobs))
+        if plan
+        else []
+    )
 
     output = PROJECT_ROOT / "output"
     output.mkdir(exist_ok=True)
@@ -123,6 +143,7 @@ def main(argv=None):
         args.arch_version,
         args.native_operators,
         jobs=args.jobs,
+        codegen_jobs=args.codegen_jobs,
     )
     if args.artifact == "run":
         destination = (

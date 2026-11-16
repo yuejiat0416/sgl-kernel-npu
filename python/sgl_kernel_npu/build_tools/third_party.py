@@ -11,8 +11,10 @@ import subprocess
 import sys
 import tempfile
 import zipfile
+from concurrent.futures import ThreadPoolExecutor
 from functools import lru_cache
 from pathlib import Path, PurePosixPath
+from time import monotonic
 
 from build_tools.cann import PROJECT_ROOT, run
 
@@ -65,7 +67,7 @@ def resolve_soc_version(arch_version):
 
 
 def resolve_plan(
-    version, arch, jobs=None, source_root=PROJECT_ROOT, *, third_party=None
+    version, arch, jobs=None, source_root=PROJECT_ROOT, *, third_party=None, workers=1
 ):
     if not re.fullmatch(r"\d+\.\d+\.\d+", version):
         raise ValueError("Expected an exact CANN version, e.g. 9.2.0")
@@ -104,7 +106,7 @@ def resolve_plan(
         additional = config.pop("additional_builds", [])
         builds.append((config_path, config))
         builds.extend((config_path, dict(config, **build)) for build in additional)
-    plan = []
+    selected = []
     for config_path, config in builds:
         if not isinstance(config.get("has_aicpu", False), bool):
             raise ValueError("has_aicpu must be a boolean")
@@ -128,7 +130,13 @@ def resolve_plan(
             continue
         builder = config.get("builder", config_path.stem)
         config["arch_version"] = str(arch)
-        config = get_adapter(builder).configure(config, jobs)
+        selected.append((builder, config))
+    group_jobs = jobs
+    if workers > 1 and jobs is not None and selected:
+        group_jobs = jobs // min(workers, len(selected), jobs)
+    plan = []
+    for builder, config in selected:
+        config = get_adapter(builder).configure(config, group_jobs)
         plan.append(
             dict(config, builder=builder, cann_version=version, arch_version=str(arch))
         )
@@ -260,7 +268,7 @@ def _load_cached(path, root, item, fingerprint):
         return None
 
 
-def build_dependencies(plan, source_root=PROJECT_ROOT):
+def build_dependencies(plan, source_root=PROJECT_ROOT, *, workers=1):
     """Reuse verified builds; publish a cache record only after full success."""
     if plan and platform.system() != "Linux":
         raise RuntimeError("Third-party CANN compilation requires Linux")
@@ -268,12 +276,14 @@ def build_dependencies(plan, source_root=PROJECT_ROOT):
         return []
     import fcntl
 
-    results = []
     root = Path(source_root) / "build/third_party"
     root.mkdir(parents=True, exist_ok=True)
     cache = root / "cache"
     cache.mkdir(exist_ok=True)
-    for item in plan:
+
+    def build_one(item):
+        started = monotonic()
+        print(f"Third-party begin: {item['name']}", flush=True)
         fingerprint, details = build_fingerprint(item)
         record_path = cache / (fingerprint + ".json")
         # Serialize builders of the same recipe across setup processes.
@@ -298,7 +308,23 @@ def build_dependencies(plan, source_root=PROJECT_ROOT):
                 temporary = record_path.with_suffix(".tmp")
                 temporary.write_text(json.dumps(record, indent=2) + "\n")
                 temporary.replace(record_path)
-            results.append(result)
+        print(
+            f"Third-party end: {item['name']} elapsed_s={monotonic() - started:.3f}",
+            flush=True,
+        )
+        return result
+
+    workers = min(workers, len(plan))
+    started = monotonic()
+    print(f"Third-party phase begin: workers={workers} groups={len(plan)}", flush=True)
+    if workers == 1:
+        results = [build_one(item) for item in plan]
+    else:
+        # Each recipe owns a separate source/build directory. Preserve plan
+        # order when staging results, regardless of worker completion order.
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            results = list(pool.map(build_one, plan))
+    print(f"Third-party phase end: elapsed_s={monotonic() - started:.3f}", flush=True)
     return results
 
 
