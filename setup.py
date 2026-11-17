@@ -5,7 +5,9 @@ import os
 import re
 import shutil
 import sys
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from time import monotonic
 
 sys.path.insert(0, str(Path(__file__).resolve().parent / "python/sgl_kernel_npu"))
 
@@ -47,6 +49,16 @@ def arguments(argv=None):
         help="build only repository-owned operators",
     )
     parser.add_argument(
+        "--parallel-third-party",
+        action="store_true",
+        help="build third-party dependencies alongside repository-owned operators",
+    )
+    parser.add_argument(
+        "--third-party-jobs",
+        type=int,
+        help="jobs for each third-party group (default: the value of --jobs)",
+    )
+    parser.add_argument(
         "--plan",
         action="store_true",
         help="print third-party build commands without building",
@@ -67,6 +79,14 @@ def arguments(argv=None):
         parser.error("--arch-version is required")
     if args.jobs < 1:
         parser.error("--jobs must be positive")
+    if args.third_party_jobs is not None and args.third_party_jobs < 1:
+        parser.error("--third-party-jobs must be positive")
+    if (args.parallel_third_party or args.third_party_jobs is not None) and (
+        args.artifact != "wheel" or args.without_third_party
+    ):
+        parser.error(
+            "third-party build controls require a wheel that includes third-party operators"
+        )
     if args.third_party is not None:
         if args.artifact != "wheel":
             parser.error("--third-party requires --artifact wheel")
@@ -104,7 +124,7 @@ def main(argv=None):
         plan = resolve_plan(
             args.cann_version or detect_cann_version(),
             args.arch_version,
-            args.jobs,
+            args.third_party_jobs or args.jobs,
             third_party=args.third_party,
         )
     if args.plan:
@@ -112,14 +132,39 @@ def main(argv=None):
 
         print(json.dumps(plan, indent=2))
         return
-    dependencies = build_dependencies(plan) if plan else []
+    if args.parallel_third_party and plan:
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            third_party = executor.submit(
+                timed_build, "Third-party", build_dependencies, plan
+            )
+            build_artifact(args, wait_for_dependencies(third_party))
+    else:
+        dependencies = timed_build("Third-party", build_dependencies, plan) if plan else []
+        build_artifact(args, dependencies)
 
+
+def timed_build(label, build, *args, **kwargs):
+    started = monotonic()
+    print(f"{label} phase begin", flush=True)
+    result = build(*args, **kwargs)
+    print(f"{label} phase end: elapsed_s={monotonic() - started:.3f}", flush=True)
+    return result
+
+
+def wait_for_dependencies(task):
+    # build_torch consumes this iterable when staging the completed wheel.
+    yield from task.result()
+
+
+def build_artifact(args, dependencies):
     output = PROJECT_ROOT / "output"
     output.mkdir(exist_ok=True)
     extension = "whl" if args.artifact == "wheel" else "run"
     for path in output.glob(f"sgl_kernel_npu-*.{extension}"):
         path.unlink()
-    native_build = build_cann(
+    native_build = timed_build(
+        "Native CANN",
+        build_cann,
         args.arch_version,
         args.native_operators,
         jobs=args.jobs,

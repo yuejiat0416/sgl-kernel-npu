@@ -9,6 +9,7 @@ import sys
 import zipfile
 from configparser import ConfigParser
 from pathlib import Path
+from time import monotonic
 
 from build_tools.cann import PROJECT_ROOT, _cache, _remove_tree, architecture, run
 
@@ -87,6 +88,36 @@ def build_torch(
         source_root,
         arch_version,
     )
+    started = monotonic()
+    print("Native Torch compile begin", flush=True)
+    run(
+        [
+            "cmake",
+            "-S",
+            source_root / "csrc/aclnn_torch_adapter",
+            "-B",
+            directory,
+            "-DCMAKE_BUILD_TYPE=Release",
+            "-DPython3_EXECUTABLE=" + sys.executable,
+            "-DSGL_ARCH_VERSION=" + arch_version,
+            "-DSGL_CANN_OPERATORS=" + ";".join(native_build.cann_operators),
+            "-DSGL_HOST_OPERATORS=" + ";".join(native_build.host_operators),
+            "-DSGL_CANN_VENDOR=" + str(native_build.vendor),
+            "-DSGL_TORCH_LIBRARY_DIR=" + str(directory / "lib"),
+        ],
+        directory / "configure.log",
+        cwd=source_root,
+    )
+    command = ["cmake", "--build", directory]
+    if jobs is not None:
+        command += ["--parallel", str(jobs)]
+    run(command, directory / "build.log", cwd=source_root)
+    library = directory / "lib/libsgl_kernel_npu.so"
+    if not library.is_file() or not library.stat().st_size:
+        raise RuntimeError("Missing Torch library: {}".format(library))
+    print(f"Native Torch compile end: elapsed_s={monotonic() - started:.3f}", flush=True)
+
+    # Third-party payloads are needed for wheel staging, not Torch compilation.
     from build_tools.third_party import stage_dependencies
 
     third_party = stage_dependencies(dependencies, package)
@@ -115,31 +146,6 @@ def build_torch(
         "third_party": third_party,
     }
     (package / "_build_manifest.json").write_text(json.dumps(manifest, indent=2) + "\n")
-    run(
-        [
-            "cmake",
-            "-S",
-            source_root / "csrc/aclnn_torch_adapter",
-            "-B",
-            directory,
-            "-DCMAKE_BUILD_TYPE=Release",
-            "-DPython3_EXECUTABLE=" + sys.executable,
-            "-DSGL_ARCH_VERSION=" + arch_version,
-            "-DSGL_CANN_OPERATORS=" + ";".join(native_build.cann_operators),
-            "-DSGL_HOST_OPERATORS=" + ";".join(native_build.host_operators),
-            "-DSGL_CANN_VENDOR=" + str(native_build.vendor),
-            "-DSGL_TORCH_LIBRARY_DIR=" + str(directory / "lib"),
-        ],
-        directory / "configure.log",
-        cwd=source_root,
-    )
-    command = ["cmake", "--build", directory]
-    if jobs is not None:
-        command += ["--parallel", str(jobs)]
-    run(command, directory / "build.log", cwd=source_root)
-    library = directory / "lib/libsgl_kernel_npu.so"
-    if not library.is_file() or not library.stat().st_size:
-        raise RuntimeError("Missing Torch library: {}".format(library))
     (package / "lib").mkdir()
     shutil.copy2(library, package / "lib" / library.name)
     print("TORCH_PACKAGE: " + str(package), flush=True)
